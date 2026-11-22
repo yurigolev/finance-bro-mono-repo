@@ -1,0 +1,25 @@
+FROM debian:bookworm-slim AS download
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM download AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN curl -fsSL --retry 3 -o whisper.tar.gz \
+      https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/refs/tags/v1.8.3 \
+    && echo '870ba21409cdf66697dc4db15ebdb13bc67037d76c7cc63756c81471d8f1731a  whisper.tar.gz' | sha256sum -c - \
+    && tar -xzf whisper.tar.gz --strip-components=1 \
+    && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+      -DGGML_NATIVE=OFF -DWHISPER_BUILD_TESTS=OFF \
+    && cmake --build build --target whisper-server --parallel 2
+
+FROM download AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/build/bin/whisper-server /usr/local/bin/
+USER 65534:65534
+ENTRYPOINT ["whisper-server"]

@@ -1,0 +1,32 @@
+{
+  "name": "financebro-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/main.js",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "test": "node --test test/parser.test.ts test/telegram.test.ts test/analytics-http.test.ts",
+    "test:integration": "node --test test/accounting.test.ts test/migrations.test.ts test/analytics.test.ts"
+  },
+  "dependencies": {
+    "@grammyjs/runner": "2.0.3",
+    "drizzle-orm": "0.45.4",
+    "grammy": "1.46.0",
+    "multilingual-stemmer": "^2.2.1",
+    "pg": "8.23.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.0.0",
+    "drizzle-kit": "0.31.11",
+    "typescript": "7.0.2"
+  }
+}

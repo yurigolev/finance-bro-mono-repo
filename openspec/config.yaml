@@ -1,0 +1,11 @@
+schema: spec-driven
+
+context: |
+  FinanceBro is a personal income and expense tracker. Telegram bot is the
+  first MVP client. The MVP tests whether people regularly record income and
+  expenses using short chat messages. See docs/planning/02-telegram-mvp.md for
+  scope and the backend stack. The first release uses Telegram long polling.
+  Standalone mobile and web client
+  development is deferred. The swift-lock-screen-capture-mvp change records
+  the paused native iOS spike. The original product context is in
+  docs/planning/01-mvp-initial-planning.md.

@@ -1,0 +1,21 @@
+server {
+    listen ${ANALYTICS_LISTEN};
+    root "${ANALYTICS_STATIC_ROOT}";
+    index index.html;
+    absolute_redirect off;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    location ~ ^/(index|200|404)\.html$ {
+        add_header Cache-Control "no-cache";
+    }
+
+    location /api/ {
+        access_log off;
+        ${ANALYTICS_DNS_DIRECTIVE}
+        set $analytics_upstream "${ANALYTICS_API_UPSTREAM}";
+        proxy_pass http://$analytics_upstream;
+        proxy_set_header Host $host;
+    }
+}

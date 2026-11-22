@@ -1,0 +1,24 @@
+{
+  "name": "financebro-tooling",
+  "private": true,
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "prepare": "husky",
+    "lint": "eslint eslint.config.mjs backend mini-app --max-warnings 0",
+    "lint:fix": "npm run lint -- --fix",
+    "format": "prettier --write backend/src backend/test mini-app/app mini-app/shared \"{backend,mini-app}/*.{ts,json}\" eslint.config.mjs package.json .prettierrc.json",
+    "format:check": "prettier --check backend/src backend/test mini-app/app mini-app/shared \"{backend,mini-app}/*.{ts,json}\" eslint.config.mjs package.json .prettierrc.json"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.15.0",
+    "eslint-plugin-vue": "10.12.1",
+    "husky": "9.1.7",
+    "prettier": "3.10.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.73.0",
+    "vue-eslint-parser": "10.4.2"
+  }
+}

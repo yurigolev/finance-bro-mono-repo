@@ -1,0 +1,118 @@
+name: financebro
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: financebro
+      POSTGRES_DB: financebro
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks: [database]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U financebro -d financebro"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./backend
+      target: tools
+    command: ["npm", "run", "db:migrate"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+    networks: [database]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bot:
+    build: ./backend
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      WHISPER_URL: http://whisper:8080/inference
+      ANALYTICS_HTTP_HOST: 0.0.0.0
+      ANALYTICS_HTTP_PORT: ${ANALYTICS_HTTP_PORT:-8787}
+      ANALYTICS_INIT_DATA_MAX_AGE_SECONDS: ${ANALYTICS_INIT_DATA_MAX_AGE_SECONDS:-3600}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    networks: [database, telegram, speech, frontend]
+    init: true
+    restart: unless-stopped
+
+  whisper-model:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.whisper
+      target: download
+    command:
+      - sh
+      - -ec
+      - |
+        digest=1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b
+        cd /models
+        if echo "$$digest  ggml-small.bin" | sha256sum -c --status; then exit 0; fi
+        curl -fsSL --retry 3 --max-time 600 -o ggml-small.bin.part \
+          https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+        echo "$$digest  ggml-small.bin.part" | sha256sum -c -
+        mv ggml-small.bin.part ggml-small.bin
+    networks: [model-download]
+    volumes:
+      - whisper-model:/models
+
+  whisper:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.whisper
+    command: ["--host", "0.0.0.0", "--model", "/models/ggml-small.bin", "--language", "ru", "--threads", "${WHISPER_THREADS:-2}", "--no-gpu", "--convert", "--tmp-dir", "/tmp"]
+    depends_on:
+      whisper-model:
+        condition: service_completed_successfully
+    networks: [speech]
+    volumes:
+      - whisper-model:/models:ro
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    restart: unless-stopped
+
+  mini-app:
+    profiles: [mini-app]
+    build: ./mini-app
+    environment:
+      ANALYTICS_LISTEN: '80'
+      ANALYTICS_API_UPSTREAM: bot:${ANALYTICS_HTTP_PORT:-8787}
+      ANALYTICS_STATIC_ROOT: /usr/share/nginx/html
+      ANALYTICS_DNS_DIRECTIVE: resolver 127.0.0.11 valid=10s ipv6=off;
+      NGINX_ENVSUBST_FILTER: ^ANALYTICS_
+    ports:
+      - '127.0.0.1:${MINI_APP_PORT:-8081}:80'
+    depends_on:
+      - bot
+    networks: [frontend]
+    restart: unless-stopped
+
+networks:
+  database:
+    internal: true
+  telegram:
+  speech:
+    internal: true
+  model-download:
+  frontend:
+
+volumes:
+  postgres-data:
+  whisper-model:
