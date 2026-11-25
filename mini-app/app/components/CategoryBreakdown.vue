@@ -23,22 +23,24 @@ const labels = {
   expense: { empty: 'Нет расходов', day: 'Расходы за день', period: 'Всего расходов' },
 }
 const shareFormat = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 })
+const compareNames = new Intl.Collator('ru').compare
 const donutSize = 192
 
 const rows = computed(() => {
   const total = BigInt(props.totalKopecks)
-  if (total === 0n) return []
   const colors = [
     `var(--${props.kind})`,
     props.kind === 'income' ? 'var(--expense)' : 'var(--income)',
     ...otherColors,
   ]
-  const categories = [...props.categories].sort(
-    (a, b) => Number(a.id === null) - Number(b.id === null),
-  )
+  const categories = [...props.categories].sort((a, b) => {
+    const uncategorizedLast = Number(a.id === null) - Number(b.id === null)
+    if (uncategorizedLast || props.kind === 'income') return uncategorizedLast
+    return compareNames(a.name, b.name) || (a.id ?? '').localeCompare(b.id ?? '')
+  })
   return categories.map((category, index) => {
     const amount = BigInt(category.amountKopecks)
-    const hundredths = (amount * 10_000n + total / 2n) / total
+    const hundredths = total === 0n ? 0n : (amount * 10_000n + total / 2n) / total
     return {
       ...category,
       id: category.id ?? 'uncategorized',
@@ -53,12 +55,13 @@ const rows = computed(() => {
 })
 
 type CategoryRow = (typeof rows.value)[number]
+const segments = computed(() => rows.value.filter(({ value }) => value > 0))
 const segmentValue = (row: CategoryRow) => row.value
 const segmentColor = (row: CategoryRow) => row.color
 const selectedRow = computed(() => rows.value.find((row) => row.id === selectedId.value))
 const summaryLabel = computed(() => {
   const kindLabels = labels[props.kind]
-  if (!rows.value.length) return kindLabels.empty
+  if (!segments.value.length) return kindLabels.empty
   return props.daily ? kindLabels.day : kindLabels.period
 })
 const selectionAttributes = computed(() => {
@@ -94,19 +97,19 @@ const segmentAttributes = computed(() => ({
 
 <template>
   <div class="category-donut" :style="{ '--donut-size': `${donutSize}px` }">
-    <VisSingleContainer :data="rows" :height="donutSize" :duration="0" aria-hidden="true">
+    <VisSingleContainer :data="segments" :height="donutSize" :duration="0" aria-hidden="true">
       <VisDonut
         :value="segmentValue"
         :color="segmentColor"
         :arc-width="20"
-        :show-background="!rows.length"
+        :show-background="!segments.length"
         :events="segmentEvents"
         :attributes="segmentAttributes"
       />
     </VisSingleContainer>
     <VisSingleContainer
-      v-if="rows.length"
-      :data="rows"
+      v-if="segments.length"
+      :data="segments"
       :height="donutSize"
       :duration="0"
       class="category-donut-selection"

@@ -2,5 +2,5 @@
 **/.output/
 **/dist/
 **/package-lock.json
-/backend/drizzle/
+/backend/services/core/drizzle/
 /web/

@@ -1,0 +1,328 @@
+openapi: 3.1.0
+info:
+  title: FinanceBro Input Processing API
+  version: 1.2.0
+  description: Разбирает текст или аудио для доверенных клиентских бэкендов.
+paths:
+  /v1/parse:
+    post:
+      operationId: parseOperationInput
+      summary: Вернуть черновик одной или нескольких операций
+      security:
+        - serviceToken: []
+      parameters:
+        - name: batch
+          in: query
+          description: Разрешить ответ со списком операций. Клиент должен подтвердить весь список перед записью.
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, context]
+              properties:
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 4096
+                context:
+                  $ref: '#/components/schemas/InputContext'
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio, context]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: До 1 МиБ и 20 секунд. Ogg, WebM, WAV, MP3, MP4/M4A, AAC или FLAC.
+                context:
+                  $ref: '#/components/schemas/InputContext'
+            encoding:
+              context:
+                contentType: application/json
+      responses:
+        '200':
+          description: Черновик и возможные уточнения
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+                format: uuid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParseResult'
+        '400':
+          description: Некорректный запрос
+          $ref: '#/components/responses/ParseError'
+        '401':
+          description: Неверный токен сервиса
+          $ref: '#/components/responses/ParseError'
+        '413':
+          description: Превышен лимит запроса, размера или продолжительности аудио
+          $ref: '#/components/responses/ParseError'
+        '415':
+          description: Неподдерживаемый тип запроса или формат аудио
+          $ref: '#/components/responses/ParseError'
+        '422':
+          description: Пустая расшифровка, неверная дата или не удалось разобрать операцию
+          $ref: '#/components/responses/ParseError'
+        '502':
+          description: Whisper вернул ошибку или неверный ответ
+          $ref: '#/components/responses/ParseError'
+        '503':
+          description: Обработчик временно недоступен
+          $ref: '#/components/responses/ParseError'
+        '504':
+          description: Истекло время ожидания Whisper
+          $ref: '#/components/responses/ParseError'
+  /v1/parse/answer:
+    post:
+      operationId: parseClarification
+      summary: Разобрать текстовый ответ о дате операции или сумме бюджетного лимита
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [kind, text]
+                  properties:
+                    kind: { const: budget-limit }
+                    text: { type: string, minLength: 1, maxLength: 4096 }
+                - type: object
+                  required: [kind, text, draft, today, timeZone]
+                  properties:
+                    kind: { const: operation-date }
+                    text: { type: string, minLength: 1, maxLength: 4096 }
+                    draft:
+                      $ref: '#/components/schemas/OperationDraft'
+                    today:
+                      type: string
+                      format: date
+                      description: Локальный день на момент создания черновика
+                    timeZone: { type: string, description: Часовой пояс IANA }
+      responses:
+        '200':
+          description: Сумма в копейках, готовая дата или варианты для выбора
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [amountKopecks]
+                    properties:
+                      amountKopecks: { type: string, pattern: '^[1-9][0-9]{0,18}$' }
+                  - type: object
+                    required: [status, draft]
+                    properties:
+                      status: { const: resolved }
+                      draft:
+                        allOf:
+                          - $ref: '#/components/schemas/OperationDraft'
+                          - properties:
+                              operationDate:
+                                $ref: '#/components/schemas/OperationDate'
+                  - type: object
+                    required: [status, dates]
+                    properties:
+                      status: { const: clarification-required }
+                      dates:
+                        type: array
+                        minItems: 2
+                        items: { type: string, format: date }
+        '400':
+          $ref: '#/components/responses/ParseError'
+        '401':
+          $ref: '#/components/responses/ParseError'
+        '413':
+          $ref: '#/components/responses/ParseError'
+        '415':
+          $ref: '#/components/responses/ParseError'
+        '422':
+          $ref: '#/components/responses/ParseError'
+        '503':
+          $ref: '#/components/responses/ParseError'
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+  responses:
+    ParseError:
+      description: Ошибка обработки ввода
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+            format: uuid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ParseError'
+  schemas:
+    Kind:
+      type: string
+      enum: [expense, income]
+    Candidate:
+      type: object
+      required: [id, name, kind]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/Kind'
+    InputContext:
+      type: object
+      required: [sentAt, timeZone, categories, categoryRules]
+      properties:
+        sentAt:
+          type: string
+          format: date-time
+          description: Время исходного сообщения с часовым смещением или Z.
+        timeZone:
+          type: string
+          description: Часовой пояс IANA.
+        kind:
+          $ref: '#/components/schemas/Kind'
+          description: Подтверждённый пользователем тип для повторного разбора.
+        categories:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/Candidate'
+              - type: object
+                required: [key]
+                properties:
+                  key:
+                    type: [string, 'null']
+                    description: Ключ встроенной категории.
+                  order:
+                    type: integer
+                    minimum: 0
+                  exactName:
+                    type: string
+        categoryRules:
+          type: array
+          items:
+            type: object
+            required: [kind, expression, categoryId]
+            properties:
+              kind:
+                $ref: '#/components/schemas/Kind'
+              expression:
+                type: string
+              categoryId:
+                type: [string, 'null']
+                format: uuid
+              builtInExpression:
+                type: string
+    OperationDate:
+      type: object
+      required: [date, timeZone]
+      properties:
+        date:
+          type: string
+          format: date
+        timeZone:
+          type: string
+    OperationDraft:
+      type: object
+      required: [kind, amountKopecks, currency, description, operationDate]
+      properties:
+        kind:
+          anyOf:
+            - $ref: '#/components/schemas/Kind'
+            - type: 'null'
+        amountKopecks:
+          type: string
+          pattern: '^[1-9][0-9]{0,18}$'
+        currency:
+          const: RUB
+        description:
+          type: string
+        operationDate:
+          anyOf:
+            - $ref: '#/components/schemas/OperationDate'
+            - type: 'null'
+    ParseResult:
+      allOf:
+        - $ref: '#/components/schemas/OperationRow'
+        - type: object
+          properties:
+            transcript:
+              type: string
+              description: Расшифровка для аудиоввода.
+            rows:
+              description: Строки черновика в порядке исходного сообщения. Присутствуют для списка операций.
+              type: array
+              minItems: 2
+              maxItems: 10
+              items:
+                $ref: '#/components/schemas/OperationRow'
+    OperationRow:
+      type: object
+      required: [draft, categoryCandidates, needsClarification]
+      properties:
+        draft:
+          $ref: '#/components/schemas/OperationDraft'
+        categoryCandidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/Candidate'
+        needsClarification:
+          type: array
+          items:
+            type: string
+            enum: [kind, categoryId, operationDate]
+        dateConfirmation:
+          type: object
+          description: Варианты для явного подтверждения даты, включая случай с одним вариантом.
+          required: [dates, today, timeZone]
+          properties:
+            dates:
+              type: array
+              minItems: 1
+              items:
+                type: string
+                format: date
+            today:
+              type: string
+              format: date
+            timeZone:
+              type: string
+    ParseError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - unauthorized
+            - unrecognized
+            - invalid_date
+            - empty_transcript
+            - audio_too_large
+            - audio_too_long
+            - unsupported_audio
+            - transcription_timeout
+            - transcription_failed
+            - not_found
+            - method_not_allowed
+            - processor_unavailable
+        message:
+          type: string
+        transcript:
+          type: string

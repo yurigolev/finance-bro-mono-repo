@@ -8,12 +8,12 @@ export function useAnalyticsOverview(
   period: Readonly<Ref<PeriodSelection | { period: 'previous-month' }>>,
 ) {
   const state = shallowRef<AnalyticsState>({ status: 'loading' })
-  const selectedDate = ref('')
   let activeRequest: AbortController | undefined
 
-  async function load(initData?: string, background = false) {
+  async function load(initData?: string, background = false, nextPeriod?: PeriodSelection) {
     if (background && activeRequest) return
-    const retainOverview = background && state.value.status === 'ready'
+    const retainOverview =
+      (background || nextPeriod !== undefined) && state.value.status === 'ready'
     activeRequest?.abort()
     if (!initData) {
       state.value = { status: 'telegram-required' }
@@ -21,7 +21,7 @@ export function useAnalyticsOverview(
     }
 
     const request = new AbortController()
-    const requestedPeriod = period.value
+    const requestedPeriod = nextPeriod ?? period.value
     const query = new URLSearchParams({ period: requestedPeriod.period })
     if (requestedPeriod.period === 'custom') {
       query.set('startDate', requestedPeriod.startDate)
@@ -44,7 +44,7 @@ export function useAnalyticsOverview(
         return
       }
       if (!response.ok) {
-        if (!retainOverview) state.value = { status: 'error' }
+        if (!background || !retainOverview) state.value = { status: 'error' }
         return
       }
 
@@ -56,16 +56,15 @@ export function useAnalyticsOverview(
           (overview.startDate !== requestedPeriod.startDate ||
             overview.endDate !== requestedPeriod.endDate))
       ) {
-        if (!retainOverview) state.value = { status: 'error' }
+        if (!background || !retainOverview) state.value = { status: 'error' }
         return
       }
 
-      if (!overview.days.some((day) => day.date === selectedDate.value)) {
-        selectedDate.value = overview.endDate
-      }
       state.value = { status: 'ready', overview }
     } catch {
-      if (!request.signal.aborted && !retainOverview) state.value = { status: 'error' }
+      if (!request.signal.aborted && (!background || !retainOverview)) {
+        state.value = { status: 'error' }
+      }
     } finally {
       if (activeRequest === request) activeRequest = undefined
     }
@@ -73,5 +72,5 @@ export function useAnalyticsOverview(
 
   onUnmounted(() => activeRequest?.abort())
 
-  return { state, selectedDate, load }
+  return { state, load }
 }

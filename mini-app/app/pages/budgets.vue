@@ -13,6 +13,7 @@ definePageMeta({ scrollToTop: false })
 useHead({ title: 'Бюджеты' })
 
 const period = ref<PeriodSelection>({ period: 'current-month' })
+const { pending, run } = usePendingAction<'previous' | 'next' | 'retry'>()
 const { state, load } = useAnalyticsOverview(period)
 const initData = useTelegramWebApp(refresh)
 const chartHeight = 220
@@ -38,8 +39,6 @@ function refresh(background = false) {
 watch(overview, (value) => {
   if (value) timeZone.value = value.timeZone
 })
-watch(period, () => refresh())
-
 function shiftMonth(direction: -1 | 1) {
   const month = selectedMonth.value
   const zone = timeZone.value
@@ -48,15 +47,18 @@ function shiftMonth(direction: -1 | 1) {
   const target = month.add({ months: direction })
   if (target.compare(month) * direction <= 0) return
 
-  period.value =
-    target.compare(startOfMonth(today(zone))) === 0
-      ? { period: 'current-month' }
-      : {
-          period: 'custom',
-          mode: 'month',
-          startDate: target.toString(),
-          endDate: endOfMonth(target).toString(),
-        }
+  return run(direction === -1 ? 'previous' : 'next', async () => {
+    period.value =
+      target.compare(startOfMonth(today(zone))) === 0
+        ? { period: 'current-month' }
+        : {
+            period: 'custom',
+            mode: 'month',
+            startDate: target.toString(),
+            endDate: endOfMonth(target).toString(),
+          }
+    await refresh()
+  })
 }
 
 function percent(amount: bigint, total: bigint) {
@@ -137,6 +139,8 @@ function money(amount: bigint) {
       v-if="state.status !== 'telegram-required'"
       :has-previous="!!selectedMonth"
       :has-next="!!selectedMonth"
+      :pending="pending === 'previous' || pending === 'next' ? pending : undefined"
+      :disabled="!!pending"
       previous-label="Предыдущий месяц"
       next-label="Следующий месяц"
       @previous="shiftMonth(-1)"
@@ -147,20 +151,29 @@ function money(amount: bigint) {
     </PeriodNavigation>
 
     <p v-if="state.status === 'telegram-required'" role="status">Откройте аналитику из меню бота</p>
-    <div v-else-if="state.status === 'error'">
+    <div v-else-if="state.status === 'error' || pending === 'retry'">
       <p role="alert">Не удалось загрузить бюджеты</p>
-      <button class="retry" type="button" @click="refresh()">Повторить</button>
+      <UiAsyncButton class="retry" :loading="pending === 'retry'" @click="run('retry', refresh)">
+        Повторить
+      </UiAsyncButton>
     </div>
     <template v-else-if="details">
       <section aria-labelledby="month-budget-heading">
         <h2 id="month-budget-heading">Бюджет на {{ details.name }}</h2>
         <div class="summary">
           <p class="amounts">
-            <strong>{{ money(details.spent) }}</strong>
+            <strong :class="{ over: details.remaining !== null && details.remaining < 0n }">
+              {{ money(details.spent) }}
+            </strong>
             <span v-if="details.limit !== null">из {{ money(details.limit) }}</span>
             <span v-else>потрачено</span>
           </p>
-          <div v-if="details.limit !== null" class="track" aria-hidden="true">
+          <div
+            v-if="details.remaining !== null"
+            class="track"
+            :class="{ 'track-below-limit': details.remaining > 0n }"
+            aria-hidden="true"
+          >
             <span :style="{ width: Math.min(100, details.spentRatio * 100) + '%' }" />
           </div>
           <p v-if="details.remaining === null" class="muted">Общий лимит не задан</p>
@@ -233,12 +246,20 @@ function money(amount: bigint) {
           <li v-for="category in details.categories" :key="category.id">
             <div class="category-row">
               <strong>{{ category.name }}</strong>
-              <span class="category-amount" :class="{ over: category.spentRatio > 1 }">
-                {{ formatKopecksAmount(category.spentKopecks) }} из
-                {{ formatKopecks(category.limitKopecks) }}
+              <span class="category-amount">
+                <span
+                  :class="{ over: BigInt(category.spentKopecks) > BigInt(category.limitKopecks) }"
+                >
+                  {{ formatKopecksAmount(category.spentKopecks) }}
+                </span>
+                <span class="category-limit">из {{ formatKopecks(category.limitKopecks) }}</span>
               </span>
             </div>
-            <div class="track" aria-hidden="true">
+            <div
+              class="track"
+              :class="{ 'track-below-limit': category.spentRatio < 1 }"
+              aria-hidden="true"
+            >
               <span :style="{ width: Math.min(100, category.spentRatio * 100) + '%' }" />
             </div>
           </li>
@@ -340,6 +361,9 @@ section {
   border-radius: inherit;
   background: var(--expense);
 }
+.track-below-limit span {
+  background: var(--accent);
+}
 .summary .track {
   height: 10px;
   margin: 6px 0 8px;
@@ -429,6 +453,10 @@ section {
 .category-amount {
   text-align: right;
   overflow-wrap: anywhere;
+}
+.category-limit {
+  margin-inline-start: 4px;
+  font-size: 0.9em;
 }
 
 .text-placeholder,

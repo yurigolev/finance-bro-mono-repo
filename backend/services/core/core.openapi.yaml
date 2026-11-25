@@ -1,0 +1,297 @@
+openapi: 3.1.0
+info:
+  title: FinanceBro Financial Core Internal API
+  version: 1.1.0
+security:
+  - botService: []
+paths:
+  /internal/v1/users/{telegramUserId}/input-context:
+    get:
+      operationId: getInputContext
+      parameters:
+        - name: telegramUserId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/TelegramUserId'
+      responses:
+        '200':
+          description: Снимок контекста до подстановки времени сообщения
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoreInputContext'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+  /internal/v1/operations:
+    post:
+      operationId: createOperation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOperation'
+      responses:
+        '201':
+          description: Операция создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedOperation'
+        '200':
+          description: Исходная операция по ключу, включая признак удаления
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedOperation'
+        '400':
+          description: Неверные поля или date_invalid
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '409':
+          description: category_unavailable
+          $ref: '#/components/responses/Error'
+  /internal/v1/operations/batch:
+    post:
+      operationId: createOperationBatch
+      summary: Записать все строки в одной транзакции
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOperationBatch'
+      responses:
+        '201':
+          description: Все операции созданы
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedOperationBatch'
+        '200':
+          description: Исходные операции по ключу черновика
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedOperationBatch'
+        '400':
+          description: Неверные поля или дата
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '409':
+          description: Недоступная категория или конфликт ключа черновика
+          $ref: '#/components/responses/Error'
+  /internal/v1/operations/replay:
+    get:
+      operationId: findOperationReplay
+      parameters:
+        - name: telegramUserId
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/TelegramUserId'
+        - name: idempotencyKey
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/IdempotencyKey'
+      responses:
+        '200':
+          description: Исходная операция или null, если записи с таким ключом нет
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/SavedOperation'
+                  - type: 'null'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+  /internal/v1/operations/{operationId}:
+    patch:
+      operationId: changeOperationCategory
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [telegramUserId, categoryId]
+              properties:
+                telegramUserId:
+                  $ref: '#/components/schemas/TelegramUserId'
+                categoryId:
+                  $ref: '#/components/schemas/CategoryId'
+      responses:
+        '200':
+          description: Категория изменена или снята
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationCategory'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: operation_unavailable
+          $ref: '#/components/responses/Error'
+        '409':
+          description: category_unavailable
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    botService:
+      type: http
+      scheme: bearer
+  responses:
+    Error:
+      description: Команда отклонена
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: string
+  schemas:
+    TelegramUserId:
+      type: integer
+      minimum: 1
+      maximum: 9007199254740991
+    IdempotencyKey:
+      type: string
+      minLength: 1
+      maxLength: 200
+    CategoryId:
+      type: [string, 'null']
+      format: uuid
+    CoreInputContext:
+      type: object
+      required: [timeZone, categories, categoryRules]
+      properties:
+        timeZone:
+          type: string
+        categories:
+          type: array
+          items:
+            allOf:
+              - $ref: './input.openapi.yaml#/components/schemas/Candidate'
+              - type: object
+                required: [key]
+                properties:
+                  key:
+                    type: [string, 'null']
+                  order:
+                    type: integer
+                    minimum: 0
+                  exactName:
+                    type: string
+        categoryRules:
+          type: array
+          items:
+            type: object
+            required: [kind, expression, categoryId]
+            properties:
+              kind:
+                $ref: './input.openapi.yaml#/components/schemas/Kind'
+              expression:
+                type: string
+              categoryId:
+                $ref: '#/components/schemas/CategoryId'
+              builtInExpression:
+                type: string
+    CreateOperation:
+      unevaluatedProperties: false
+      allOf:
+        - $ref: '#/components/schemas/OperationWriteFields'
+        - type: object
+          required: [telegramUserId, idempotencyKey]
+          properties:
+            telegramUserId:
+              $ref: '#/components/schemas/TelegramUserId'
+            idempotencyKey:
+              $ref: '#/components/schemas/IdempotencyKey'
+    CreateOperationBatch:
+      type: object
+      additionalProperties: false
+      required: [telegramUserId, idempotencyKey, rows]
+      properties:
+        telegramUserId:
+          $ref: '#/components/schemas/TelegramUserId'
+        idempotencyKey:
+          $ref: '#/components/schemas/IdempotencyKey'
+        rows:
+          type: array
+          minItems: 2
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/OperationWriteFields'
+            unevaluatedProperties: false
+    SavedOperationBatch:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          minItems: 2
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/SavedOperation'
+    OperationWriteFields:
+      type: object
+      required: [kind, amountKopecks, currency, description, categoryId]
+      properties:
+        kind:
+          $ref: './input.openapi.yaml#/components/schemas/Kind'
+        amountKopecks:
+          type: string
+          pattern: '^[1-9][0-9]{0,18}$'
+          description: Положительное число копеек в диапазоне PostgreSQL bigint.
+        currency:
+          const: RUB
+        description:
+          type: string
+          maxLength: 200
+        operationDate:
+          $ref: './input.openapi.yaml#/components/schemas/OperationDate'
+        categoryId:
+          $ref: '#/components/schemas/CategoryId'
+    OperationCategory:
+      type: object
+      required: [id, kind, categoryId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          $ref: './input.openapi.yaml#/components/schemas/Kind'
+        categoryId:
+          $ref: '#/components/schemas/CategoryId'
+    SavedOperation:
+      allOf:
+        - $ref: '#/components/schemas/OperationCategory'
+        - type: object
+          required: [categoryName, replayed, deleted]
+          properties:
+            categoryName:
+              type: [string, 'null']
+            replayed:
+              type: boolean
+            deleted:
+              type: boolean

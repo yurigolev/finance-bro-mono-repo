@@ -5,18 +5,22 @@ const model = defineModel<Value>({ required: true })
 
 defineProps<{
   options: readonly { value: Value; label: string }[]
+  disabled?: boolean
+  pending?: Value
 }>()
 </script>
 
 <template>
-  <RadioGroupRoot v-model="model" class="period-control" orientation="horizontal">
-    <RadioGroupItem
-      v-for="option in options"
-      :key="option.value"
-      class="period-option"
-      :value="option.value"
-    >
-      {{ option.label }}
+  <RadioGroupRoot
+    v-model="model"
+    class="period-control"
+    orientation="horizontal"
+    :disabled="disabled"
+  >
+    <RadioGroupItem v-for="option in options" :key="option.value" :value="option.value" as-child>
+      <UiAsyncButton class="period-option" :disabled="disabled" :loading="pending === option.value">
+        {{ option.label }}
+      </UiAsyncButton>
     </RadioGroupItem>
   </RadioGroupRoot>
 </template>

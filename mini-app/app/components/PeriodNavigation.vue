@@ -7,6 +7,8 @@ withDefaults(
     hasNext: boolean
     previousLabel?: string
     nextLabel?: string
+    pending?: 'previous' | 'next'
+    disabled?: boolean
   }>(),
   { previousLabel: 'Предыдущий период', nextLabel: 'Следующий период' },
 )
@@ -16,27 +18,29 @@ defineEmits<{ previous: []; next: [] }>()
 
 <template>
   <div class="period-range">
-    <button
+    <UiAsyncButton
       class="period-arrow"
       type="button"
       :aria-label="previousLabel"
-      :disabled="!hasPrevious"
+      :disabled="disabled || !hasPrevious"
+      :loading="pending === 'previous'"
       @click="$emit('previous')"
     >
       <ChevronLeft :size="22" aria-hidden="true" />
-    </button>
+    </UiAsyncButton>
     <div class="period-label" aria-live="polite">
       <slot />
     </div>
-    <button
+    <UiAsyncButton
       class="period-arrow"
       type="button"
       :aria-label="nextLabel"
-      :disabled="!hasNext"
+      :disabled="disabled || !hasNext"
+      :loading="pending === 'next'"
       @click="$emit('next')"
     >
       <ChevronRight :size="22" aria-hidden="true" />
-    </button>
+    </UiAsyncButton>
   </div>
 </template>
 
@@ -50,6 +54,12 @@ defineEmits<{ previous: []; next: [] }>()
   color: var(--text);
   font-size: 17px;
   font-weight: 750;
+}
+
+.period-range.analytics-glass {
+  margin-top: 8px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
 }
 
 .period-label {
@@ -66,6 +76,11 @@ defineEmits<{ previous: []; next: [] }>()
   border-radius: var(--radius-pill);
   background: var(--control);
   color: var(--muted);
+}
+
+.period-range.analytics-glass .period-arrow {
+  height: 35px;
+  background: transparent;
 }
 
 .period-arrow:disabled {

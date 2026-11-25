@@ -4,7 +4,7 @@ import vue from 'eslint-plugin-vue'
 import tseslint from 'typescript-eslint'
 
 export default defineConfig(
-  globalIgnores(['**/dist/', '**/.nuxt/', '**/.output/', 'backend/drizzle/', 'web/']),
+  globalIgnores(['**/dist/', '**/.nuxt/', '**/.output/', 'backend/services/core/drizzle/', 'web/']),
   {
     files: ['eslint.config.mjs'],
     extends: [js.configs.recommended],

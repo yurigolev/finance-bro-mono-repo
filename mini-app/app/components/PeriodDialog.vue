@@ -9,6 +9,18 @@ import {
   today,
 } from '@internationalized/date'
 import {
+  CalendarCell,
+  CalendarCellTrigger,
+  CalendarGrid,
+  CalendarGridBody,
+  CalendarGridHead,
+  CalendarGridRow,
+  CalendarHeadCell,
+  CalendarHeader,
+  CalendarHeading,
+  CalendarNext,
+  CalendarPrev,
+  CalendarRoot,
   DialogClose,
   DialogContent,
   DialogDescription,
@@ -36,16 +48,25 @@ import {
   TabsRoot,
   TabsTrigger,
   type DateRange,
+  type DateValue,
 } from 'reka-ui'
 import type { CustomPeriod, CustomPeriodMode } from '#shared/types/analytics'
-import { formatDateRange } from '~/utils/analytics-format'
+import { formatDateRange, formatMonthRange } from '~/utils/analytics-format'
 
-const props = defineProps<{ selection?: CustomPeriod; timeZone: string }>()
+const props = defineProps<{
+  selection?: CustomPeriod
+  timeZone: string
+  monthOnly?: boolean
+  glassTrigger?: boolean
+  disabled?: boolean
+  loading?: boolean
+}>()
 const emit = defineEmits<{ apply: [selection: CustomPeriod] }>()
 
 const modes = [
   { value: 'month', label: 'Месяц' },
   { value: 'week', label: 'Неделя' },
+  { value: 'day', label: 'День' },
   { value: 'range', label: 'Диапазон' },
 ] as const
 
@@ -60,14 +81,22 @@ const monthHeading = new Intl.DateTimeFormat(locale, {
 
 const open = ref(false)
 const sheetFooter = useTemplateRef('sheetFooter')
-const mode = ref<CustomPeriodMode>('range')
+const mode = ref<CustomPeriodMode>('day')
 const maxDate = shallowRef(today(props.timeZone))
 const year = ref(maxDate.value.year)
 const weekPage = shallowRef(startOfMonth(maxDate.value))
 const monthSelection = ref('')
 const weekSelection = ref('')
+const daySelection = shallowRef<DateValue | null>(null)
 const range = shallowRef<DateRange | null>(null)
-const rangePage = shallowRef(maxDate.value)
+const calendarPage = shallowRef(maxDate.value)
+
+watch(
+  () => props.loading,
+  (loading, wasLoading) => {
+    if (!loading && wasLoading) open.value = false
+  },
+)
 
 watch(
   sheetFooter,
@@ -136,6 +165,7 @@ const weeks = computed(() => {
 })
 
 const dates = computed(() => {
+  if (mode.value === 'day') return { start: daySelection.value, end: daySelection.value }
   if (mode.value === 'range') return range.value
   if (mode.value === 'month') {
     const start = parseDate(monthSelection.value)
@@ -160,26 +190,28 @@ const tooLong = computed(() => {
 })
 
 function setOpen(value: boolean) {
+  if (props.loading) return
   if (value) {
     const active = props.selection
     const now = today(props.timeZone)
     const start = active ? parseDate(active.startDate) : now
     maxDate.value = now
-    mode.value = active?.mode ?? 'range'
+    mode.value = props.monthOnly ? 'month' : (active?.mode ?? 'day')
     year.value = start.year
     monthSelection.value = startOfMonth(start).toString()
     weekPage.value = startOfMonth(active?.mode === 'week' ? parseDate(active.endDate) : start)
     weekSelection.value = startOfWeek(start, locale).toString()
-    rangePage.value = start
+    calendarPage.value = start
+    daySelection.value = active?.mode === 'day' ? start : null
     range.value = active ? { start, end: parseDate(active.endDate) } : null
   }
   open.value = value
 }
 
 function apply() {
-  if (!selectedRange.value || tooLong.value) return
+  if (!selectedRange.value || tooLong.value || props.loading) return
   emit('apply', { period: 'custom', mode: mode.value, ...selectedRange.value })
-  open.value = false
+  if (props.monthOnly) open.value = false
 }
 </script>
 
@@ -187,28 +219,38 @@ function apply() {
   <DialogRoot :open="open" @update:open="setOpen">
     <DialogTrigger
       class="period-dialog-trigger"
-      :class="{ 'period-dialog-selected': selection }"
-      aria-label="Выбрать период"
+      :class="{
+        'analytics-glass': glassTrigger,
+        'period-dialog-selected': selection && !monthOnly,
+      }"
+      :aria-label="monthOnly ? 'Выбрать месяц' : 'Выбрать период'"
+      :disabled="disabled"
     >
       <CalendarDays :size="22" aria-hidden="true" />
     </DialogTrigger>
 
     <DialogPortal>
-      <DialogOverlay class="period-overlay" />
-      <DialogContent class="period-sheet">
+      <DialogOverlay class="bottom-sheet-overlay" />
+      <DialogContent class="bottom-sheet period-sheet">
         <div class="sheet-handle" aria-hidden="true" />
         <header class="sheet-header">
-          <DialogTitle class="sheet-title">Выбрать период</DialogTitle>
+          <DialogTitle class="sheet-title">{{
+            monthOnly ? 'Выбрать месяц' : 'Выбрать период'
+          }}</DialogTitle>
           <DialogDescription class="sr-only">
-            Выберите календарный месяц, неделю или даты начала и конца периода.
+            {{
+              monthOnly
+                ? 'Выберите календарный месяц.'
+                : 'Выберите день, неделю, месяц или диапазон дат.'
+            }}
           </DialogDescription>
-          <DialogClose class="sheet-close" aria-label="Закрыть">
+          <DialogClose class="sheet-close" aria-label="Закрыть" :disabled="loading">
             <X :size="24" aria-hidden="true" />
           </DialogClose>
         </header>
 
-        <TabsRoot v-model="mode" class="sheet-tabs">
-          <TabsList class="period-control" aria-label="Тип периода">
+        <TabsRoot v-model="mode" class="sheet-tabs" :inert="loading">
+          <TabsList v-if="!monthOnly" class="period-control" aria-label="Тип периода">
             <TabsTrigger
               v-for="item in modes"
               :key="item.value"
@@ -287,11 +329,62 @@ function apply() {
             </RadioGroupRoot>
           </TabsContent>
 
+          <TabsContent value="day" class="sheet-panel">
+            <CalendarRoot
+              v-slot="{ date, grid, weekDays }"
+              v-model="daySelection"
+              :default-placeholder="calendarPage"
+              :min-value="minDate"
+              :max-value="maxDate"
+              :locale="locale"
+              :week-starts-on="1"
+              weekday-format="short"
+              calendar-label="День"
+              prevent-deselect
+            >
+              <CalendarHeader class="sheet-navigation">
+                <CalendarPrev class="sheet-arrow" aria-label="Предыдущий месяц">
+                  <ChevronLeft :size="20" aria-hidden="true" />
+                </CalendarPrev>
+                <CalendarHeading class="sheet-calendar-heading">
+                  {{ monthHeading.format(date.toDate('UTC')) }} {{ date.year }}
+                </CalendarHeading>
+                <CalendarNext class="sheet-arrow" aria-label="Следующий месяц">
+                  <ChevronRight :size="20" aria-hidden="true" />
+                </CalendarNext>
+              </CalendarHeader>
+              <CalendarGrid
+                v-for="month in grid"
+                :key="month.value.toString()"
+                class="sheet-calendar"
+              >
+                <CalendarGridHead>
+                  <CalendarGridRow>
+                    <CalendarHeadCell v-for="day in weekDays" :key="day">{{
+                      day
+                    }}</CalendarHeadCell>
+                  </CalendarGridRow>
+                </CalendarGridHead>
+                <CalendarGridBody>
+                  <CalendarGridRow v-for="(week, index) in month.rows" :key="index">
+                    <CalendarCell v-for="day in week" :key="day.toString()" :date="day">
+                      <CalendarCellTrigger
+                        class="sheet-day sheet-single-day"
+                        :day="day"
+                        :month="month.value"
+                      />
+                    </CalendarCell>
+                  </CalendarGridRow>
+                </CalendarGridBody>
+              </CalendarGrid>
+            </CalendarRoot>
+          </TabsContent>
+
           <TabsContent value="range" class="sheet-panel">
             <RangeCalendarRoot
               v-slot="{ date, grid, weekDays }"
               v-model="range"
-              :default-placeholder="rangePage"
+              :default-placeholder="calendarPage"
               :min-value="minDate"
               :max-value="maxDate"
               :locale="locale"
@@ -340,21 +433,26 @@ function apply() {
             Выберите не больше {{ maxRangeDays }} дней
           </p>
           <p v-else aria-live="polite">
-            <template v-if="selectedRange">
+            <template v-if="selectedRange && monthOnly">
+              {{ formatMonthRange(selectedRange.startDate, selectedRange.endDate) }}
+              {{ selectedRange.startDate.slice(0, 4) }}
+            </template>
+            <template v-else-if="selectedRange">
               {{ formatDateRange(selectedRange.startDate, selectedRange.endDate) }}
             </template>
+            <template v-else-if="mode === 'day'">Выберите день</template>
             <template v-else>{{
               range?.start ? 'Выберите дату окончания' : 'Выберите дату начала'
             }}</template>
           </p>
-          <button
+          <UiAsyncButton
             class="sheet-apply"
-            type="button"
             :disabled="!selectedRange || tooLong"
+            :loading="loading"
             @click="apply"
           >
             Применить
-          </button>
+          </UiAsyncButton>
         </footer>
       </DialogContent>
     </DialogPortal>
@@ -371,7 +469,7 @@ function apply() {
   color: var(--muted);
 }
 
-.period-dialog-trigger,
+.period-dialog-trigger:not(.analytics-glass),
 .sheet-arrow {
   background: var(--control);
 }
@@ -381,26 +479,16 @@ function apply() {
   color: var(--accent);
 }
 
-.period-dialog-selected {
+.period-dialog-selected:not(.analytics-glass) {
   background: var(--accent-surface);
 }
 
-.period-overlay {
-  position: fixed;
-  z-index: 5;
-  inset: 0;
-  background: rgb(0 0 0 / 54%);
+.period-dialog-selected.analytics-glass {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .period-sheet {
-  position: fixed;
-  z-index: 6;
-  inset: auto 0 0;
-  display: flex;
-  flex-direction: column;
-  width: min(100%, 480px);
   max-height: 100dvh;
-  margin-inline: auto;
   padding: 12px max(16px, env(safe-area-inset-right))
     calc(
       24px +
@@ -412,63 +500,7 @@ function apply() {
     max(16px, env(safe-area-inset-left));
   overflow-y: auto;
   overscroll-behavior: contain;
-  border-radius: 32px 32px 0 0;
   background: color-mix(in srgb, var(--background) 55%, var(--control));
-  color: var(--text);
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .period-sheet[data-state='open'] {
-    animation: period-sheet-enter 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
-  }
-
-  .period-sheet[data-state='closed'] {
-    animation: period-sheet-exit 220ms ease-in both;
-  }
-
-  .period-overlay[data-state='open'] {
-    animation: period-overlay-enter 280ms ease-out both;
-  }
-
-  .period-overlay[data-state='closed'] {
-    animation: period-overlay-exit 220ms ease-in both;
-  }
-
-  @keyframes period-sheet-enter {
-    from {
-      transform: translateY(100%);
-    }
-    to {
-      transform: translateY(0);
-    }
-  }
-
-  @keyframes period-sheet-exit {
-    from {
-      transform: translateY(0);
-    }
-    to {
-      transform: translateY(100%);
-    }
-  }
-
-  @keyframes period-overlay-enter {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 1;
-    }
-  }
-
-  @keyframes period-overlay-exit {
-    from {
-      opacity: 1;
-    }
-    to {
-      opacity: 0;
-    }
-  }
 }
 
 .sheet-handle {
@@ -582,7 +614,8 @@ function apply() {
   border-end-end-radius: 20px;
 }
 
-.sheet-day:is([data-selection-start], [data-selection-end]) {
+.sheet-day:is([data-selection-start], [data-selection-end]),
+.sheet-single-day[data-selected] {
   border-radius: var(--radius-pill);
   background: var(--accent);
   color: var(--background);
@@ -595,7 +628,8 @@ function apply() {
   outline-offset: -2px;
 }
 
-.sheet-day:is([data-selection-start], [data-selection-end]):focus-visible {
+.sheet-day:is([data-selection-start], [data-selection-end]):focus-visible,
+.sheet-single-day[data-selected]:focus-visible {
   outline-color: var(--background);
 }
 
@@ -654,7 +688,7 @@ function apply() {
   font-weight: 750;
 }
 
-.sheet-apply:disabled {
+.sheet-apply:disabled:not([aria-busy='true']) {
   background: var(--control);
   color: var(--muted);
   cursor: default;

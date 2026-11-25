@@ -6,13 +6,6 @@ import ChartContainer from '~/components/ui/ChartContainer.vue'
 import { formatDay, formatKopecks } from '~/utils/analytics-format'
 
 const props = defineProps<{ days: Day[] }>()
-const selectedDate = defineModel<string>({ required: true })
-const emit = defineEmits<{ selectDay: [date: string] }>()
-
-function selectDay(date: string) {
-  selectedDate.value = date
-  emit('selectDay', date)
-}
 
 const chartConfig = {
   income: { label: 'Доходы', color: 'var(--income)' },
@@ -33,7 +26,6 @@ const colors = series.map((kind) => `var(--color-${kind})`)
 const plotHeight = 139
 const noSpacing = { top: 0, right: 0, bottom: 0, left: 0 }
 
-const selectedDay = computed(() => props.days.find((day) => day.date === selectedDate.value))
 const xDomain = computed<[number, number]>(() => [0, props.days.length])
 
 const numberFormat = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 })
@@ -93,13 +85,6 @@ function axisDay(date: string) {
         >
       </div>
       <div class="plot">
-        <div class="plot-grid" aria-hidden="true">
-          <span
-            v-for="tick in yTicks"
-            :key="tick"
-            :style="{ bottom: `${(tick / yDomain[1]) * 100}%` }"
-          />
-        </div>
         <VisXYContainer
           :data="chartDays"
           :height="plotHeight"
@@ -123,19 +108,6 @@ function axisDay(date: string) {
             rounded-corners
           />
         </VisXYContainer>
-
-        <div class="plot-days">
-          <button
-            v-for="day in days"
-            :key="day.date"
-            type="button"
-            :aria-label="formatDay(day.date)"
-            :aria-pressed="day.date === selectedDate"
-            :title="formatDay(day.date)"
-            :class="{ selected: day.date === selectedDate }"
-            @click="selectDay(day.date)"
-          />
-        </div>
       </div>
       <div class="plot-dates" aria-hidden="true" :class="{ 'across-months': crossesMonth }">
         <span v-for="(day, index) in days" :key="day.date">
@@ -144,15 +116,13 @@ function axisDay(date: string) {
       </div>
     </div>
 
-    <div v-if="selectedDay" class="selected-day" aria-live="polite">
-      <time :datetime="selectedDay.date">{{ formatDay(selectedDay.date) }}</time>
-      <span class="selected-day-amounts">
-        <span v-for="kind in series" :key="kind" class="legend-item">
-          <span class="sr-only">{{ chartConfig[kind].label }} </span>
-          <span class="series-dot" :class="kind" aria-hidden="true" />
-          <span>{{ formatKopecks(selectedDay[`${kind}Kopecks`]) }}</span>
+    <ul class="sr-only" aria-label="Доходы и расходы по дням">
+      <li v-for="day in days" :key="day.date">
+        <time :datetime="day.date">{{ formatDay(day.date) }}</time>
+        <span v-for="kind in series" :key="kind">
+          {{ chartConfig[kind].label }} {{ formatKopecks(day[`${kind}Kopecks`]) }}
         </span>
-      </span>
-    </div>
+      </li>
+    </ul>
   </ChartContainer>
 </template>

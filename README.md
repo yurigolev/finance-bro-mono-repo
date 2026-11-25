@@ -21,23 +21,24 @@ Telegram-бот для учёта доходов и расходов в рубл
 
 - `BOT_TOKEN` — токен тестового бота от BotFather.
 - `POSTGRES_PASSWORD` — случайный пароль PostgreSQL. Подойдёт значение из `openssl rand -hex 24`.
+- `CORE_SERVICE_TOKEN` и `INPUT_SERVICE_TOKEN` — два отдельных случайных секрета, каждый можно получить командой `openssl rand -hex 32`.
 - `DATABASE_URL` — `postgresql://financebro:<пароль>@db:5432/financebro`. Подставьте тот же пароль. Специальные символы в пароле кодируйте для URL.
 
-Если `backend/.env` уже заполнен, используйте его.
+При обновлении существующего `backend/.env` добавьте оба сервисных секрета.
 
 Запускайте Compose из корня проекта.
 
 ```sh
 docker compose --env-file backend/.env up -d --build
 docker compose --env-file backend/.env ps
-docker compose --env-file backend/.env logs --tail=50 bot whisper
+docker compose --env-file backend/.env logs --tail=50 core bot input whisper
 ```
 
-Compose поднимает PostgreSQL, применяет SQL-миграции через Drizzle Kit и запускает бота. Тот же запуск обновляет существующую базу. Старые суммы, описания и ключи повторной доставки сохраняются. У старых операций категория сначала отображается как «Без категории».
+Compose поднимает PostgreSQL, применяет SQL-миграции через Drizzle Kit и запускает финансовое ядро, Telegram-бота и обработчик ввода. При обновлении используется существующий том PostgreSQL. Старые суммы, описания и ключи повторной доставки сохраняются. У старых операций категория сначала отображается как «Без категории».
 
-При первом запуске Compose собирает `whisper.cpp` и скачивает многоязычную модель `small` (~466 МиБ) в том `whisper-model`. Дождитесь статуса `healthy` у `whisper`. Он распознаёт русский язык на CPU внутри закрытой сети. По умолчанию используются два потока. Чтобы изменить число потоков, задайте `WHISPER_THREADS` в `backend/.env` и повторите запуск Compose. Бот скачивает голосовые из Telegram. Аудио обрабатывается в памяти, FinanceBro не сохраняет аудио и полные расшифровки.
+При первом запуске Compose собирает `whisper.cpp` и скачивает многоязычную модель `small` (~466 МиБ) в том `whisper-model`. Дождитесь статуса `healthy` у `whisper`. Он распознаёт русский язык на CPU внутри закрытой сети. По умолчанию используются два потока. Чтобы изменить число потоков, задайте `WHISPER_THREADS` в `backend/.env` и повторите запуск Compose. Бот скачивает голосовые из Telegram и передаёт их обработчику. Обработчик проверяет аудио во временной памяти контейнера и передаёт его Whisper. FinanceBro не сохраняет аудио и полные расшифровки в PostgreSQL.
 
-Бот получает обновления через long polling. На один токен запускайте один процесс. PostgreSQL доступен только внутри сети Compose, данные лежат в томе `postgres-data`.
+Бот получает обновления через long polling. На один токен запускайте один процесс. К PostgreSQL подключаются финансовое ядро и миграции. Данные лежат в томе `postgres-data`. Бот вызывает внутренние API ядра и обработчика. Другим доверенным клиентским бэкендам можно выдать отдельные токены через `INPUT_CLIENT_TOKENS` (через запятую) и предоставить доступ к приватному `POST /v1/parse`.
 
 ### Запуск с Mini App
 
@@ -45,7 +46,9 @@ Compose поднимает PostgreSQL, применяет SQL-миграции �
 docker compose --env-file backend/.env --profile mini-app up -d --build
 ```
 
-Nginx раздаёт Mini App на `http://127.0.0.1:8081` и проксирует `/api` к бэкенду. Порт на хосте можно изменить через `MINI_APP_PORT` в `backend/.env`. Для запуска внутри Telegram нужен доступный HTTPS-адрес. См. [инструкцию тестового запуска](integration/telegram-mini-app/README.md).
+Nginx раздаёт Mini App на `http://127.0.0.1:8081` и проксирует `/api/` к финансовому ядру. Порт на хосте можно изменить через `MINI_APP_PORT` в `backend/.env`. Для запуска внутри Telegram нужен доступный HTTPS-адрес. См. [инструкцию тестового запуска](integration/telegram-mini-app/README.md).
+
+Внутренние контракты описаны в [OpenAPI обработчика](backend/services/input/input.openapi.yaml) и [OpenAPI ядра](backend/services/core/core.openapi.yaml).
 
 ### Проверка голосового ввода
 
@@ -75,7 +78,9 @@ npm run format:check
 
 В Git-репозитории `npm ci` устанавливает хук Husky. Перед коммитом он запускает `lint` и `format:check`. Ошибка проверки блокирует коммит.
 
-В `backend/` с Node.js 24:
+В `backend/services/` лежат три npm-workspace: `core` (финансовое ядро, API и PostgreSQL), `bot` (Telegram и HTTP-клиенты), `input` (разбор операций, ответов о датах и лимитах, вызов Whisper). Каждый собирается в свой образ с кодом и зависимостями сервиса. Общие HTTP-контракты находятся в `backend/packages/contracts/`, календарь и категории — в `backend/packages/shared/`. Бот хранит черновики диалогов, а после разбора передаёт структурированные команды ядру.
+
+Команды разработки запускаются из `backend/` с Node.js 24:
 
 ```sh
 npm ci
@@ -85,6 +90,6 @@ npm test
 npm run db:generate
 ```
 
-`db:generate` создаёт SQL-миграцию при изменении схемы. SQL и метаданные находятся в `backend/drizzle/`. Чтобы применить миграции отдельно, из корня проекта запустите `docker compose --env-file backend/.env run --rm migrate`.
+`db:generate` создаёт SQL-миграцию при изменении схемы. SQL и метаданные находятся в `backend/services/core/drizzle/`. Чтобы применить миграции отдельно, из корня проекта запустите `docker compose --env-file backend/.env run --rm migrate`.
 
 Для проверки учёта задайте `DATABASE_URL` отдельной тестовой PostgreSQL и выполните `npm run db:migrate`, затем `npm run test:integration`. Для проверки чистой установки и обновления задайте также `MIGRATION_TEST_DATABASE_URL` выделенного тестового PostgreSQL с правом `CREATEDB`. Тесты миграций создают и удаляют временные базы в этом экземпляре.

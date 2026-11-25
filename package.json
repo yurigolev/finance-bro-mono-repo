@@ -8,8 +8,8 @@
     "prepare": "husky",
     "lint": "eslint eslint.config.mjs backend mini-app --max-warnings 0",
     "lint:fix": "npm run lint -- --fix",
-    "format": "prettier --write backend/src backend/test mini-app/app mini-app/shared \"{backend,mini-app}/*.{ts,json}\" eslint.config.mjs package.json .prettierrc.json",
-    "format:check": "prettier --check backend/src backend/test mini-app/app mini-app/shared \"{backend,mini-app}/*.{ts,json}\" eslint.config.mjs package.json .prettierrc.json"
+    "format": "prettier --write \"backend/{packages,services,test}/**/*.{ts,json}\" mini-app/app mini-app/shared \"{backend,mini-app}/*.{ts,json}\" eslint.config.mjs package.json .prettierrc.json",
+    "format:check": "prettier --check \"backend/{packages,services,test}/**/*.{ts,json}\" mini-app/app mini-app/shared \"{backend,mini-app}/*.{ts,json}\" eslint.config.mjs package.json .prettierrc.json"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

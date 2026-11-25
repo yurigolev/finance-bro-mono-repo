@@ -1,21 +1,28 @@
 import assert from 'node:assert/strict'
 import { randomInt } from 'node:crypto'
 import test from 'node:test'
+import { setImmediate } from 'node:timers/promises'
 import { Api, Bot } from 'grammy'
 import type { Message, ReplyKeyboardMarkup, Update } from 'grammy/types'
-import { createApplication } from '../src/app.ts'
-import { createBudgetViews } from '../src/budgets/service.ts'
-import { createDatabase } from '../src/db/client.ts'
-import { createBot } from '../src/telegram/bot.ts'
+import { createApplication } from '../services/core/app.ts'
+import { createBudgetViews } from '../services/core/budgets/service.ts'
+import { createDatabase } from '../services/core/db/client.ts'
+import { createBot, type TelegramOperationInput } from '../services/bot/bot.ts'
 import {
   createTelegramSession,
   type BotContext,
   type TelegramSession,
-} from '../src/telegram/context.ts'
-import type { TelegramDependencies } from '../src/telegram/dependencies.ts'
-import { createVoiceTranscriber, type TranscribeVoice } from '../src/telegram/operations/voice.ts'
-import { createLoadDailyHistory } from '../src/transactions/service.ts'
-import type { RecordOperationResult } from '../src/transactions/types.ts'
+} from '../services/bot/context.ts'
+import type { TelegramDependencies } from '../packages/contracts/telegram-dependencies.ts'
+import { downloadVoice, VoiceDownloadError } from '../services/bot/operations/voice.ts'
+import { recordParsedOperation, type TelegramInput } from '../services/bot/operation-input.ts'
+import { buildOperationResult } from '../services/input/http.ts'
+import { parseClarification } from '../services/input/operation.ts'
+import { budgetLimitResultSchema, operationDateResultSchema } from '../packages/contracts/input.ts'
+
+type TranscribeVoice = (api: Api, fileId: string) => Promise<string>
+import { createLoadDailyHistory } from '../services/core/transactions/service.ts'
+import type { RecordOperationResult } from '../packages/contracts/transactions.ts'
 
 const telegramUser = { id: 123, is_bot: false, first_name: 'Пользователь' }
 const privateChat = {
@@ -151,7 +158,7 @@ test('grammY session shares state across overlapping updates and drops expired s
   assert.notEqual(observed.at(-1), shared)
 })
 
-test('validates the text field in Whisper responses', async (t) => {
+test('downloads Telegram voice files and handles download failures', async (t) => {
   const api = new Api('fake-token')
   api.config.use(async (_previous, method, payload) => {
     assert.equal(method, 'getFile')
@@ -165,20 +172,15 @@ test('validates the text field in Whisper responses', async (t) => {
       } as never,
     }
   })
-  let body: unknown = { text: '480 кофе', language: 'ru' }
-  const whisperUrl = 'https://whisper.example/inference'
+  let downloadStatus = 200
   t.mock.method(globalThis, 'fetch', async (input: URL | string) => {
-    if (input === whisperUrl) return Response.json(body)
     assert.equal(String(input), 'https://api.telegram.org/file/botfake-token/voices/voice.ogg')
-    return new Response(new Uint8Array([1]))
+    return new Response(new Uint8Array([1]), { status: downloadStatus })
   })
-  const transcribe = createVoiceTranscriber(whisperUrl)
-
-  assert.equal(await transcribe(api, 'voice-file'), '480 кофе')
-  body = { text: 480 }
-  await assert.rejects(transcribe(api, 'voice-file'), {
-    message: 'Invalid transcription response',
-  })
+  const signal = new AbortController().signal
+  assert.deepEqual(await downloadVoice(api, 'voice-file', signal), new Uint8Array([1]))
+  downloadStatus = 404
+  await assert.rejects(downloadVoice(api, 'voice-file', signal), VoiceDownloadError)
 })
 
 type MockDependencies = TelegramDependencies['users'] &
@@ -221,6 +223,8 @@ function harness(
   }: Partial<MockDependencies> = {},
   rejectRichMessage = false,
   transcribeVoice?: TranscribeVoice,
+  operationInput?: TelegramOperationInput,
+  submitBatch?: TelegramInput['submitBatch'],
 ) {
   return botHarness(
     {
@@ -258,6 +262,9 @@ function harness(
     },
     rejectRichMessage,
     transcribeVoice,
+    operationInput,
+    ownerId,
+    submitBatch,
   )
 }
 
@@ -265,11 +272,103 @@ function botHarness(
   dependencies: TelegramDependencies,
   rejectRichMessage = false,
   transcribeVoice?: TranscribeVoice,
+  operationInput?: TelegramOperationInput,
+  testOwnerId = ownerId,
+  submitBatch?: TelegramInput['submitBatch'],
 ) {
-  const bot = createBot('fake-token', dependencies, transcribeVoice)
+  const localParse: TelegramInput['parseText'] = async (text, context) => {
+    const result = buildOperationResult(text, context, (_context, draft) => ({
+      kind: draft.kind,
+      categoryCandidates: [],
+    }))
+    if ('error' in result) return { ok: false, error: result.error, message: result.message }
+    return { ok: true, result }
+  }
+  const input: TelegramInput = {
+    submitBatch:
+      submitBatch ??
+      (async () => {
+        throw new Error('Unexpected batch submission')
+      }),
+    async loadContext() {
+      return {
+        categories: [],
+        categoryRules: [],
+        timeZone: (await dependencies.users.getTimeZone(testOwnerId)) ?? 'UTC',
+      }
+    },
+    parseText: localParse,
+    async parseAudio(file, context) {
+      const [success, ...bytes] = new Uint8Array(await file.arrayBuffer())
+      if (!success) return { ok: false, error: 'transcription_failed' }
+      const transcript = new TextDecoder().decode(Uint8Array.from(bytes)).trim()
+      if (!transcript) return { ok: false, error: 'empty_transcript' }
+      const parsed = await localParse(transcript, context)
+      if (!parsed.ok) return { ...parsed, transcript }
+      return { ok: true, result: { ...parsed.result, transcript } }
+    },
+    async parseDate(text, context) {
+      const result = parseClarification({ kind: 'operation-date', text, ...context })
+      if ('error' in result) return { ok: false, error: result.error, message: result.message }
+      return { ok: true, result: operationDateResultSchema.parse(result) }
+    },
+    async parseBudgetLimit(text) {
+      const result = parseClarification({ kind: 'budget-limit', text })
+      if ('error' in result) return { ok: false, error: result.error }
+      return { ok: true, result: budgetLimitResultSchema.parse(result) }
+    },
+    async setCategory(telegramId, operationId, categoryId) {
+      const userId = await dependencies.users.getOrCreateUser(telegramId)
+      return (await dependencies.categories.setCategory(userId, operationId, categoryId))
+        ? 'updated'
+        : 'unavailable'
+    },
+    async submit(telegramId, operation, key) {
+      const userId = await dependencies.users.getOrCreateUser(telegramId)
+      const { amountKopecks, description, kind, operationDate } = operation
+      return dependencies.transactions.recordOperation(
+        userId,
+        {
+          amountKopecks,
+          description,
+          ...(kind === undefined ? {} : { kind }),
+          ...(operationDate === undefined ? {} : { operationDate }),
+        },
+        key,
+      )
+    },
+    ...(operationInput && {
+      ...operationInput,
+      submit: (telegramId, operation, key) =>
+        recordParsedOperation(operationInput, telegramId, operation, key),
+    }),
+  }
+  const fakeDownload: typeof downloadVoice | undefined = transcribeVoice
+    ? async (api, fileId) => {
+        try {
+          const text = await transcribeVoice(api, fileId)
+          return Uint8Array.of(1, ...new TextEncoder().encode(text))
+        } catch (error) {
+          if (error instanceof VoiceDownloadError) throw error
+          return Uint8Array.of(0)
+        }
+      }
+    : undefined
+  const bot = createBot('fake-token', dependencies, input, fakeDownload)
   bot.botInfo = botInfo
   const calls: ApiCall[] = []
   bot.api.config.use(async (_previous, method, payload) => {
+    if (method === 'getFile') {
+      assert.deepEqual(payload, { file_id: 'voice-file' })
+      return {
+        ok: true,
+        result: {
+          file_id: 'voice-file',
+          file_unique_id: 'unique-voice-file',
+          file_path: 'voices/voice.ogg',
+        } as never,
+      }
+    }
     const isRich = 'rich_message' in (payload as object)
     if (isRich && rejectRichMessage) {
       calls.push({ method, payload })
@@ -556,7 +655,7 @@ test('statistics keeps daily totals when monthly budgets fail to load', async ()
 test('budget input can be corrected or cancelled and expires at the month boundary', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: new Date('2025-11-30T12:00:00Z') })
   const changes: Parameters<TelegramDependencies['budgets']['changeBudgetLimit']>[] = []
-  const results = ['invalid', 'saved', 'stale'] as const
+  const results = ['saved', 'stale'] as const
   const { dispatch, latestMessage, press, reply } = harness(
     {
       changeBudgetLimit: async (...args) => {
@@ -580,7 +679,6 @@ test('budget input can be corrected or cancelled and expires at the month bounda
   assert.match(latestMessage().message.text, /положительную сумму/u)
   await reply('8 000,25', invalid)
   assert.deepEqual(changes, [
-    [ownerId, '2025-11-01', null, { kind: 'set', amountKopecks: null }],
     [ownerId, '2025-11-01', null, { kind: 'set', amountKopecks: 800_025n }],
   ])
 
@@ -594,8 +692,8 @@ test('budget input can be corrected or cancelled and expires at the month bounda
   t.mock.timers.setTime(new Date('2025-12-01T00:00:00Z').getTime())
   await reply('10 000', expired)
   assert.match(latestMessage().message.text, /Месяц изменился/u)
-  assert.equal(changes.length, 3)
-  assert.deepEqual(changes[2], [
+  assert.equal(changes.length, 2)
+  assert.deepEqual(changes[1], [
     ownerId,
     '2025-11-01',
     null,
@@ -668,6 +766,8 @@ function ownerHarness(
     },
     rejectRichMessage,
     transcribeVoice,
+    undefined,
+    userId,
   )
 }
 
@@ -774,6 +874,51 @@ test('waits for the database before acknowledging an operation', async () => {
   )
 })
 
+test('signed text records the selected kind immediately with or without a description', async () => {
+  for (const [text, amountKopecks, description, kind, receipt] of [
+    ['+1000 ыы', 100_000n, 'ыы', 'income', /📈 <b>\+ 1\s000,00 ₽<\/b> \(ыы\)/u],
+    ['+ 10000 sss', 1_000_000n, 'sss', 'income', /📈 <b>\+ 10\s000,00 ₽<\/b> \(sss\)/u],
+    ['- 480 зарплата', 48_000n, 'зарплата', 'expense', /📉 <b>− 480,00 ₽<\/b> \(зарплата\)/u],
+    ['+ 10000', 1_000_000n, '', 'income', /📈 <b>\+ 10\s000,00 ₽<\/b>\n🏷 Без категории/u],
+    ['− 480,50', 48_050n, '', 'expense', /📉 <b>− 480,50 ₽<\/b>\n🏷 Без категории/u],
+  ] as const) {
+    const writes: Parameters<TelegramDependencies['transactions']['recordOperation']>[] = []
+    const { calls, dispatch, latestMessage } = harness({
+      recordOperation: async (...args) => {
+        writes.push(args)
+        return kind === 'income' ? savedIncome : savedExpense
+      },
+    })
+
+    await dispatch(textUpdate(text))
+    assert.deepEqual(writes, [[ownerId, { amountKopecks, description, kind }, textKey]], text)
+    assert.equal(calls.filter(({ message }) => message).length, 1, text)
+    assert.match(latestMessage().message.text, receipt, text)
+  }
+})
+
+test('an unsigned amount without a description records after choosing a kind', async () => {
+  const draft = { amountKopecks: 48_000n, description: '' }
+  const writes: Parameters<TelegramDependencies['transactions']['recordOperation']>[] = []
+  const { dispatch, latestMessage, press } = harness({
+    recordOperation: async (...args) => {
+      writes.push(args)
+      return args[1].kind ? savedExpense : { status: 'kind-required' }
+    },
+  })
+
+  await dispatch(textUpdate('480'))
+  assert.deepEqual(writes, [[ownerId, draft, textKey]])
+  assert.match(latestMessage().message.text, /Доход или расход\?[^]*480 ₽/u)
+  assert.doesNotMatch(latestMessage().message.text, / · /u)
+  await press('📉 Расход')
+  assert.deepEqual(writes, [
+    [ownerId, draft, textKey],
+    [ownerId, { ...draft, kind: 'expense' }, textKey],
+  ])
+  assert.match(latestMessage().message.text, /📉 <b>− 480,00 ₽<\/b>\n🏷 Без категории/u)
+})
+
 test('automatically records voice by message identity and can delete it after a category change', async () => {
   const key = `telegram:voice:${privateChat.id}:7`
   const draft = { ...operationDraft, amountKopecks: 25_000n }
@@ -814,6 +959,12 @@ test('automatically records voice by message identity and can delete it after a 
   )
 
   await dispatch(voiceUpdate())
+  assert.match(calls[0]?.message?.text ?? '', /Расшифровываю голосовое/u)
+  assert.deepEqual(
+    calls.map(({ method }) => method),
+    ['sendMessage', 'editMessageText'],
+  )
+  assert.equal(latestMessage().message.message_id, calls[0]?.message?.message_id)
   assert.match(latestMessage().message.text, /250,00 ₽<\/b> \(кофе\)/u)
   await press('Кафе')
   const receipt = latestMessage()
@@ -825,14 +976,47 @@ test('automatically records voice by message identity and can delete it after a 
   assert.deepEqual(buttons(latestMessage().payload), [])
   const previousCalls = calls.length
   await dispatch({ ...voiceUpdate(), update_id: 45 })
-  assert.equal(calls.length, previousCalls)
+  assert.deepEqual(
+    calls.slice(previousCalls).map(({ method }) => method),
+    ['sendMessage', 'editMessageText'],
+  )
+  assert.match(latestMessage().message.text, /Операция уже записана/u)
 })
 
-test('rejects long voice messages before transcription and clarifies invalid inputs like text', async () => {
+test('shows progress while transcribing voice and edits it on failure', async (t) => {
+  t.mock.method(console, 'error', () => undefined)
+  const started = Promise.withResolvers<void>()
+  const transcript = Promise.withResolvers<string>()
+  const { calls, dispatch, latestMessage } = harness({}, false, () => {
+    started.resolve()
+    return transcript.promise
+  })
+
+  const processing = dispatch(voiceUpdate())
+  await Promise.race([started.promise, processing])
+  const progress = latestMessage().message
+  assert.match(progress.text, /Расшифровываю голосовое/u)
+  assert.equal((latestMessage().payload as { reply_markup?: unknown }).reply_markup, undefined)
+  assert.deepEqual(
+    calls.map(({ method }) => method),
+    ['sendMessage'],
+  )
+
+  transcript.reject(new Error('Transcription failed'))
+  await processing
+  assert.deepEqual(
+    calls.map(({ method }) => method),
+    ['sendMessage', 'editMessageText'],
+  )
+  assert.equal(latestMessage().message.message_id, progress.message_id)
+  assert.match(latestMessage().message.text, /Не удалось распознать голосовое/u)
+})
+
+test('rejects long voice messages and quotes the transcript when parsing fails', async () => {
   let attempts = 0
   let writes = 0
-  const transcript = 'Кофе за двести и такси за пятьсот'
-  const { dispatch, latestMessage } = harness(
+  const transcript = 'Кофе <&> и такси ☕️'
+  const { calls, dispatch, latestMessage } = harness(
     {
       recordOperation: async () => {
         writes++
@@ -852,11 +1036,57 @@ test('rejects long voice messages before transcription and clarifies invalid inp
   await dispatch(voiceUpdate())
   assert.equal(attempts, 1)
   assert.equal(writes, 0)
+  assert.equal(calls.at(-1)?.method, 'editMessageText')
+  assert.equal(latestMessage().message.message_id, calls.at(-2)?.message?.message_id)
   const clarification = latestMessage().message.text
-  assert.match(clarification, /Уточните сумму и описание одной операции/u)
+  const [reason] = clarification.split('\n\n')
+  assert.match(reason!, /Не удалось разобрать операцию из голосового/u)
+  assert.match(reason!, /✍️ Укажите сумму одной операции/u)
+  assert.equal(clarification, reason + '\n\n' + transcript)
+  assert.deepEqual((calls.at(-1)?.payload as { entities?: unknown }).entities, [
+    { type: 'blockquote', offset: reason!.length + 2, length: transcript.length },
+  ])
   await dispatch(textUpdate(transcript))
-  assert.equal(latestMessage().message.text, clarification)
+  assert.match(latestMessage().message.text, /^✍️ Укажите сумму одной операции/u)
+  assert.ok(!latestMessage().message.text.includes(transcript))
   assert.equal(writes, 0)
+})
+
+test('explains download failures and empty transcripts without a quote', async (t) => {
+  t.mock.method(console, 'error', () => undefined)
+  const download = harness({}, false, async () => {
+    throw new VoiceDownloadError(new Error('download failed'))
+  })
+  await download.dispatch(voiceUpdate())
+  assert.match(download.latestMessage().message.text, /Не удалось загрузить голосовое из Telegram/u)
+  assert.ok(!('entities' in (download.calls.at(-1)?.payload as object)))
+
+  const empty = harness({}, false, async () => ' \n ')
+  await empty.dispatch(voiceUpdate())
+  assert.match(empty.latestMessage().message.text, /не удалось распознать слова/u)
+  assert.ok(!('entities' in (empty.calls.at(-1)?.payload as object)))
+})
+
+test('quotes voice transcripts when date validation or recording fails', async (t) => {
+  t.mock.method(console, 'error', () => undefined)
+  for (const [transcript, expected] of [
+    ['480 кофе 31 февраля', /Такой даты нет/u],
+    ['480 кофе', /Не удалось подтвердить запись/u],
+  ] as const) {
+    const { dispatch, latestMessage } = harness(
+      {
+        recordOperation: async () => {
+          throw new Error('database failed')
+        },
+      },
+      false,
+      async () => transcript,
+    )
+    await dispatch(voiceUpdate())
+    const { text } = latestMessage().message
+    assert.match(text, expected)
+    assert.ok(text.endsWith('\n\n' + transcript))
+  }
 })
 
 test('text and voice with the same unknown description ask for a kind before saving', async () => {
@@ -889,8 +1119,12 @@ test('text and voice with the same unknown description ask for a kind before sav
 
   await dispatch(voiceUpdate())
   assert.equal(latestMessage().message.text, textPrompt)
+  assert.equal(calls.at(-1)?.method, 'editMessageText')
+  assert.equal(latestMessage().message.message_id, calls.at(-2)?.message?.message_id)
   assert.equal(writes.length, 0)
   const prompt = latestMessage()
+  await dispatch({ ...voiceUpdate(), update_id: 44 })
+  assert.match(latestMessage().message.text, /в предыдущем сообщении/u)
   await Promise.all([press('📈 Доход', prompt), press('📉 Расход', prompt)])
   assert.deepEqual(writes, [[ownerId, { ...draft, kind: 'income' }, voiceKey]])
   assert.equal(calls.findLast(({ message }) => message)?.method, 'editMessageText')
@@ -899,7 +1133,10 @@ test('text and voice with the same unknown description ask for a kind before sav
 
   const previousCalls = calls.length
   await dispatch({ ...voiceUpdate(), update_id: 45 })
-  assert.equal(calls.length, previousCalls)
+  assert.deepEqual(
+    calls.slice(previousCalls).map(({ method }) => method),
+    ['sendMessage', 'editMessageText'],
+  )
 })
 
 test(
@@ -1152,7 +1389,7 @@ test('ambiguous input gets a clarification without a database call', async () =>
   })
   await dispatch(textUpdate('15 00 проект'))
   assert.equal(touchedDatabase, false)
-  assert.match((calls[0]?.payload as { text: string }).text, /^✍️ Уточните /u)
+  assert.match((calls[0]?.payload as { text: string }).text, /^✍️ Укажите сумму одной операции/u)
 })
 
 test('ignores group messages', async () => {
@@ -1165,7 +1402,7 @@ test('chooses, changes and clears an income category, then deletes the income in
   const assignments: (string | null)[] = []
   const { calls, dispatch, latestMessage, press } = harness({
     recordOperation: async (...args) => {
-      assert.deepEqual(args, [ownerId, incomeDraft, 'telegram:42'])
+      assert.deepEqual(args, [ownerId, income, 'telegram:42'])
       return savedIncome
     },
     getOperationKind: async (...args) => {
@@ -1860,8 +2097,337 @@ function datedText(text: string, date = novemberSaturday) {
   return update
 }
 
+test('processor voice preserves date and kind prompts and refreshes a stale receipt category', async (t) => {
+  const travelId = '32000000-0000-4000-8000-000000000000'
+  const cafe = { id: categoryId, name: '☕ Кафе', kind: 'expense', key: null } as const
+  const travel = { id: travelId, name: '✈️ Путешествия', kind: 'expense', key: null } as const
+  const context = {
+    timeZone: 'Asia/Yekaterinburg',
+    categories: [cafe, travel],
+    categoryRules: [],
+  }
+  const transcript = 'В прошлый вторник кофе в путешествии 400р'
+  const sentAt = '2026-11-24T12:00:00.000Z'
+  const voiceKey = 'telegram:voice:123:7'
+  const operationDate = { date: '2026-11-17', timeZone: context.timeZone }
+  const parsedDraft = {
+    kind: null,
+    amountKopecks: '40000',
+    description: 'кофе в путешествии',
+    currency: 'RUB',
+    operationDate,
+  } as const
+  let categoryName: string | null = null
+  let writes = 0
+  let checks = 0
+  let rematches = 0
+  let categoryRefreshes = 0
+  t.mock.method(globalThis, 'fetch', async (input: URL) => {
+    assert.equal(String(input), 'https://api.telegram.org/file/botfake-token/voices/voice.ogg')
+    return new Response(new Uint8Array([1, 2, 3]))
+  })
+  const processor: TelegramOperationInput = {
+    loadContext: async (telegramId) => {
+      assert.equal(telegramId, telegramUser.id)
+      return context
+    },
+    parseAudio: async (file, requestContext) => {
+      assert.equal(file.type, 'audio/ogg')
+      assert.deepEqual([...new Uint8Array(await file.arrayBuffer())], [1, 2, 3])
+      assert.deepEqual(requestContext, { ...context, sentAt })
+      return {
+        ok: true,
+        result: {
+          transcript,
+          draft: parsedDraft,
+          categoryCandidates: [],
+          needsClarification: ['kind', 'operationDate'],
+          dateConfirmation: {
+            dates: [operationDate.date],
+            today: '2026-11-24',
+            timeZone: context.timeZone,
+          },
+        },
+      }
+    },
+    parseText: async (input, requestContext) => {
+      rematches++
+      assert.equal(input, transcript)
+      assert.deepEqual(requestContext, { ...context, sentAt, kind: 'expense' })
+      return {
+        ok: true,
+        result: {
+          draft: { ...parsedDraft, kind: 'expense' },
+          categoryCandidates: [cafe, travel],
+          needsClarification: ['categoryId'],
+        },
+      }
+    },
+    hasOperation: async (...args) => {
+      checks++
+      assert.deepEqual(args, [telegramUser.id, voiceKey])
+      return writes > 0
+    },
+    recordOperation: async (...args) => {
+      writes++
+      assert.deepEqual(args, [
+        telegramUser.id,
+        {
+          kind: 'expense',
+          amountKopecks: 40_000n,
+          description: parsedDraft.description,
+          operationDate,
+        },
+        null,
+        voiceKey,
+      ])
+      return savedExpense
+    },
+    setCategory: async (telegramId, id, selected) => {
+      assert.equal(telegramId, telegramUser.id)
+      assert.equal(id, operationId)
+      if (selected === travelId) return 'category-unavailable'
+      assert.equal(selected, categoryId)
+      categoryName = cafe.name
+      return 'updated'
+    },
+  }
+  const { calls, dispatch, latestMessage, press } = harness(
+    {
+      getOperationKind: async () => 'expense',
+      getOperation: async () => ({
+        id: operationId,
+        kind: 'expense',
+        amountKopecks: 40_000n,
+        description: parsedDraft.description,
+        operationDate,
+        idempotencyKey: voiceKey,
+        createdAt: new Date(sentAt),
+        categoryName,
+      }),
+      listCategories: async () => {
+        categoryRefreshes++
+        return [cafe]
+      },
+    },
+    true,
+    undefined,
+    processor,
+  )
+  const voice = voiceUpdate()
+  voice.message.date = Date.parse(sentAt) / 1000
+  await dispatch(voice)
+  const progressId = calls[0]?.message?.message_id
+  assert.match(calls[0]?.message?.text ?? '', /Расшифровываю голосовое/u)
+  assert.match(latestMessage().message.text, /Подтвердите операцию[^]*вторник, 17 ноября/u)
+  assert.equal(writes, 0)
+  await press('✅ Записать')
+  assert.match(latestMessage().message.text, /Доход или расход\?/u)
+  assert.equal(writes, 0)
+  await press('📉 Расход')
+  assert.equal(writes, 1)
+  assert.equal(rematches, 1)
+  assert.match(latestMessage().message.text, /400,00 ₽[^]*Выберите категорию/u)
+  assert.equal(latestMessage().message.message_id, progressId)
+  await press(travel.name)
+  assert.equal(categoryRefreshes, 1)
+  assert.ok(!buttons(latestMessage().payload).some(({ text }) => text === travel.name))
+  await press(cafe.name)
+  assert.equal(latestMessage().message.message_id, progressId)
+  assert.match(latestMessage().message.text, /☕ Кафе/u)
+
+  await dispatch({ ...voice, update_id: 45 })
+  await press('✅ Записать')
+  assert.match(latestMessage().message.text, /Операция уже записана/u)
+  assert.equal(writes, 1)
+  assert.equal(checks, 2)
+})
+
+test('processor text refreshes an unavailable category before saving with the same operation key', async () => {
+  const stale = { id: categoryId, name: 'Архивная категория', kind: 'expense', key: null } as const
+  const replacement = {
+    id: '33000000-0000-4000-8000-000000000000',
+    name: 'Доступная категория',
+    kind: 'expense',
+    key: null,
+  } as const
+  let contextReads = 0
+  const attempts: [string | null, string][] = []
+  const processor: TelegramOperationInput = {
+    loadContext: async () => ({
+      timeZone: 'UTC',
+      categories: [contextReads++ === 0 ? stale : replacement],
+      categoryRules: [],
+    }),
+    parseText: async () => ({
+      ok: true,
+      result: {
+        draft: {
+          kind: 'expense',
+          amountKopecks: '48000',
+          description: 'кофе',
+          currency: 'RUB',
+          operationDate: null,
+        },
+        categoryCandidates: [stale],
+        needsClarification: [],
+      },
+    }),
+    parseAudio: async () => {
+      throw new Error('unexpected parseAudio call')
+    },
+    hasOperation: async () => false,
+    recordOperation: async (_telegramId, _operation, selected, key) => {
+      attempts.push([selected, key])
+      return selected === stale.id
+        ? { status: 'category-unavailable' }
+        : { ...savedExpense, categoryName: replacement.name }
+    },
+    setCategory: async () => 'unavailable',
+  }
+  const { dispatch, latestMessage, press } = harness({}, true, undefined, processor)
+  await dispatch(textUpdate('480 кофе'))
+  const prompt = latestMessage()
+  assert.match(prompt.message.text, /Категория больше недоступна/u)
+  assert.deepEqual(attempts, [[stale.id, textKey]])
+  await press(replacement.name, prompt)
+  assert.equal(latestMessage().message.message_id, prompt.message.message_id)
+  assert.match(latestMessage().message.text, /Доступная категория/u)
+  assert.deepEqual(attempts, [
+    [stale.id, textKey],
+    [replacement.id, textKey],
+  ])
+  assert.equal(contextReads, 2)
+})
+
 test(
-  'category matches set the type and ambiguous or unknown inputs wait for a choice',
+  'dated processor text keeps the chat order while the first parse is pending',
+  { timeout: 3000 },
+  async () => {
+    const first = '17.11 кофе 400₽'
+    const second = '18.11 такси 700₽'
+    const parsingFirst = Promise.withResolvers<void>()
+    const releaseFirst = Promise.withResolvers<void>()
+    const parsedTexts: string[] = []
+    const savedKeys: string[] = []
+    const processor: TelegramOperationInput = {
+      loadContext: async () => ({ timeZone: 'UTC', categories: [], categoryRules: [] }),
+      parseText: async (input) => {
+        parsedTexts.push(input)
+        if (input === first) {
+          parsingFirst.resolve()
+          await releaseFirst.promise
+        }
+        return {
+          ok: true,
+          result: {
+            draft: {
+              kind: 'expense',
+              amountKopecks: input === first ? '40000' : '70000',
+              currency: 'RUB',
+              description: input === first ? 'кофе' : 'такси',
+              operationDate: null,
+            },
+            categoryCandidates: [],
+            needsClarification: ['operationDate'],
+            dateConfirmation: {
+              dates: [input === first ? '2026-11-17' : '2026-11-18'],
+              today: '2026-11-21',
+              timeZone: 'UTC',
+            },
+          },
+        }
+      },
+      parseAudio: async () => {
+        throw new Error('unexpected parseAudio call')
+      },
+      hasOperation: async () => false,
+      recordOperation: async (_telegramId, _operation, _category, key) => {
+        savedKeys.push(key)
+        return savedExpense
+      },
+      setCategory: async () => 'unavailable',
+    }
+    const { calls, dispatch, press } = harness({}, true, undefined, processor)
+
+    const firstUpdate = dispatch(datedText(first))
+    await parsingFirst.promise
+    const secondUpdate = dispatch({ ...datedText(second), update_id: 43 })
+    await setImmediate()
+    const parsedWhileFirstPending = [...parsedTexts]
+    releaseFirst.resolve()
+    await Promise.all([firstUpdate, secondUpdate])
+
+    assert.deepEqual(parsedWhileFirstPending, [first])
+    const prompts = calls.flatMap(({ message, payload }) =>
+      message?.text.includes('Подтвердите операцию') ? [{ message, payload }] : [],
+    )
+    assert.equal(prompts.length, 2)
+    assert.match(prompts[0]!.message.text, /кофе/u)
+    assert.match(prompts[1]!.message.text, /такси/u)
+    await Promise.all(prompts.map((prompt) => press('✅ Записать', prompt)))
+    assert.deepEqual(savedKeys, ['telegram:42', 'telegram:43'])
+  },
+)
+
+test(
+  'dated café and travel entries keep text and voice receipts and deletion behavior equivalent',
+  { skip: !budgetTestDatabaseUrl },
+  async (t) => {
+    const { db, pool } = createDatabase(budgetTestDatabaseUrl!)
+    t.after(() => pool.end())
+    const app = createApplication(db).telegram
+    const userId = await app.users.getOrCreateUser(randomInt(2 ** 40, 2 ** 41))
+    const timeZone = 'Asia/Yekaterinburg'
+    assert.deepEqual(await app.users.setTimeZone(userId, timeZone), { timeZone })
+    const input = 'В прошлый вторник кофе в путешествии 400 ₽'
+    const sentAt = Date.parse('2026-11-24T12:00:00Z') / 1000
+    const text = datedText(input, sentAt)
+    const voice = voiceUpdate()
+    voice.message.date = sentAt
+    const { dispatch, latestMessage, press } = ownerHarness(app, userId, true, async () => input)
+
+    for (const update of [text, voice]) {
+      await dispatch(update)
+      const confirmation = latestMessage().message
+      assert.match(confirmation.text, /Подтвердите операцию/u)
+      assert.match(confirmation.text, /вторник, 17 ноября/u)
+      assert.deepEqual(await app.transactions.recent(userId), [])
+
+      await press('✅ Записать')
+      const receipt = latestMessage()
+      assert.equal(receipt.message.message_id, confirmation.message_id)
+      assert.match(receipt.message.text, /📉 <b>− 400,00 ₽<\/b> \(кофе в путешествии\)/u)
+      assert.deepEqual(
+        buttons(receipt.payload)
+          .slice(0, 2)
+          .map(({ text }) => text)
+          .sort(),
+        ['☕ Кафе', '✈️ Путешествия'],
+      )
+
+      const [saved] = await app.transactions.recent(userId)
+      assert.ok(saved)
+      const stored = await app.transactions.getOperation(userId, saved.id)
+      assert.deepEqual(stored?.operationDate, { date: '2026-11-17', timeZone })
+      assert.equal(stored?.categoryName, null)
+      await press('☕ Кафе', receipt)
+      assert.match(latestMessage().message.text, /☕ Кафе/u)
+      assert.equal((await app.transactions.getOperation(userId, saved.id))?.categoryName, '☕ Кафе')
+      await press('🗑 Удалить')
+      assert.equal(latestMessage().message.text, '🗑 Операция удалена.')
+      assert.deepEqual(await app.transactions.recent(userId), [])
+    }
+
+    await dispatch({ ...voice, update_id: 45 })
+    await press('✅ Записать')
+    assert.match(latestMessage().message.text, /Операция уже записана/u)
+    assert.deepEqual(await app.transactions.recent(userId), [])
+  },
+)
+
+test(
+  'explicit signs set the kind and unsigned inputs use category matches or wait for a choice',
   { skip: !budgetTestDatabaseUrl },
   async (t) => {
     const { db, pool } = createDatabase(budgetTestDatabaseUrl!)
@@ -1875,17 +2441,17 @@ test(
     await send('20000 зарплата')
     assert.match(latestMessage().message.text, /📈 <b>\+ [^]*💼 Зарплата/u)
     await send('-20000 зарплата')
-    assert.match(latestMessage().message.text, /📈 <b>\+ [^]*💼 Зарплата/u)
+    assert.match(latestMessage().message.text, /📉 <b>− [^]*Без категории/u)
     await send('+250 кофе')
-    assert.match(latestMessage().message.text, /📉 <b>− [^]*☕ Кафе/u)
-    await send('+3000 подарок')
+    assert.match(latestMessage().message.text, /📈 <b>\+ [^]*Без категории/u)
+    await send('-3000 подарок')
     assert.match(latestMessage().message.text, /📉 <b>− [^]*🎁 Подарки/u)
 
     assert.equal(await app.categories.addCategory(userId, 'income', 'Разовые услуги'), 'ok')
     assert.equal(await app.categories.addCategory(userId, 'expense', 'Разовые услуги'), 'ok')
     const beforeChoice = await app.transactions.recent(userId)
     assert.equal(beforeChoice.length, 4)
-    await send('+3000 разовые услуги')
+    await send('3000 разовые услуги')
     const kindPrompt = latestMessage()
     assert.match(kindPrompt.message.text, /Доход или расход\?/u)
     assert.deepEqual(
@@ -1900,7 +2466,7 @@ test(
     assert.equal((await app.transactions.recent(userId)).length, 5)
 
     const callCount = calls.length
-    await dispatch({ ...datedText('+3000 разовые услуги'), update_id: updateId - 1 })
+    await dispatch({ ...datedText('3000 разовые услуги'), update_id: updateId - 1 })
     assert.equal(calls.length, callCount)
 
     await send('в понедельник 321 тестовое описание')
@@ -1918,6 +2484,25 @@ test(
     await press('↩️ Отмена')
     await press('📈 Доход', cancelled)
     assert.equal((await app.transactions.recent(userId)).length, 6)
+
+    await send('+ 10000')
+    assert.match(latestMessage().message.text, /📈 <b>\+ 10\s000,00 ₽<\/b>\s/u)
+    await send('123')
+    await press('📉 Расход')
+    const saved = await app.transactions.recent(userId)
+    assert.equal(saved.length, 8)
+    assert.ok(
+      saved.some(
+        ({ kind, amountKopecks, description }) =>
+          kind === 'income' && amountKopecks === 1_000_000n && description === '',
+      ),
+    )
+    assert.ok(
+      saved.some(
+        ({ kind, amountKopecks, description }) =>
+          kind === 'expense' && amountKopecks === 12_300n && description === '',
+      ),
+    )
   },
 )
 
@@ -1957,7 +2542,6 @@ test('dated text records the requested civil day and never silently records inva
     ['23.11.2026 480 кофе', /Дата в будущем/u],
     ['на прошлой неделе 480 кофе', /конкретный день/u],
     ['вчера и позавчера 480 кофе', /несколько дат/u],
-    ['вчера 480 кофе и 700 такси', /одной операции/u],
   ] as const) {
     const count = writes.length
     await dispatch(datedText(text))
@@ -2011,20 +2595,21 @@ test('weekday drafts show the chosen date, resolve a mismatch and confirm just o
   assert.match(latestMessage().message.text, /расходятся/u)
   const disagreement = latestMessage()
   await press('↩️ Отмена', separateDraft)
-  await press('вторник, 17 ноября', disagreement)
-  const preview = latestMessage()
   assert.deepEqual(dates, [])
-  await Promise.all([press('✅ Записать', preview), press('✅ Записать', preview)])
+  await Promise.all([
+    press('вторник, 17 ноября', disagreement),
+    press('вторник, 17 ноября', disagreement),
+  ])
   assert.deepEqual(dates, ['2026-11-17'])
   assert.equal(calls.findLast(({ message }) => message)?.method, 'editMessageText')
-  assert.equal(latestMessage().message.message_id, preview.message.message_id)
+  assert.equal(latestMessage().message.message_id, disagreement.message.message_id)
   assert.match(latestMessage().message.text, /📉 <b>− /u)
 })
 
 test('voice uses the same confirmation rules for inferred and explicit dates as text', async () => {
   const writes: Parameters<TelegramDependencies['transactions']['recordOperation']>[] = []
   let transcript = 'В прошлый вторник я потратил четыреста восемьдесят рублей на кофе.'
-  const { dispatch, latestMessage, press, reply } = harness(
+  const { calls, dispatch, latestMessage, press, reply } = harness(
     {
       getTimeZone: async () => 'Asia/Yekaterinburg',
       recordOperation: async (...args) => {
@@ -2038,6 +2623,11 @@ test('voice uses the same confirmation rules for inferred and explicit dates as 
   const update = voiceUpdate()
   update.message.date = novemberSaturday
   await dispatch(update)
+  assert.deepEqual(
+    calls.map(({ method }) => method),
+    ['sendMessage', 'editMessageText'],
+  )
+  assert.equal(latestMessage().message.message_id, calls[0]?.message?.message_id)
   assert.match(latestMessage().message.text, /Подтвердите операцию/u)
   assert.match(latestMessage().message.text, /480 ₽<\/b> · кофе\n📅 вторник, 10 ноября/u)
   assert.equal(
@@ -2051,8 +2641,7 @@ test('voice uses the same confirmation rules for inferred and explicit dates as 
   await reply('31.02.2026', prompt)
   assert.match(latestMessage().message.text, /Такой даты нет/u)
   await reply('18.11.2026', prompt)
-  assert.match(latestMessage().message.text, /среда, 18 ноября/u)
-  await press('✅ Записать')
+  assert.match(latestMessage().message.text, /18 ноября/u)
   assert.deepEqual(writes, [
     [
       ownerId,
@@ -2077,6 +2666,31 @@ test('voice uses the same confirmation rules for inferred and explicit dates as 
     'telegram:voice:123:8',
   ])
   assert.match(latestMessage().message.text, /21 ноября/u)
+})
+
+test('records a multiline voice transcript with a relative date and one amount', async () => {
+  const writes: Parameters<TelegramDependencies['transactions']['recordOperation']>[] = []
+  const { dispatch } = harness(
+    {
+      getTimeZone: async () => 'Asia/Yekaterinburg',
+      recordOperation: async (...args) => {
+        writes.push(args)
+        return savedExpense
+      },
+    },
+    false,
+    async () =>
+      'Так, что там было? Ну давай допустим, окей.\nТри дня назад...\n...такси 700 рублей.',
+  )
+  const update = voiceUpdate()
+  update.message.date = novemberSaturday
+  await dispatch(update)
+
+  assert.equal(writes.length, 1)
+  const [, operation] = writes[0]!
+  assert.equal(operation.amountKopecks, 70_000n)
+  assert.match(operation.description, /такси$/u)
+  assert.deepEqual(operation.operationDate, { date: '2026-11-18', timeZone: 'Asia/Yekaterinburg' })
 })
 
 test('changing a receipt date updates the same operation, preserves its category and refreshes the receipt', async () => {
@@ -2107,8 +2721,6 @@ test('changing a receipt date updates the same operation, preserves its category
   await press('📅 Дата')
   await press('⌨️ Ввести дату')
   await reply('31.10.2026')
-  assert.equal(current, '2026-11-21')
-  await press('✅ Сохранить дату')
   assert.equal(current, '2026-10-31')
   assert.equal(latestMessage().message.message_id, receipt.message.message_id)
   assert.match(latestMessage().message.text, /Кафе\n📅 суббота, 31 октября/u)
@@ -2159,7 +2771,7 @@ test('date drafts bind separate replies and expire independently, including on a
   })
   await press('⌨️ Ввести дату')
   const second = latestMessage()
-  await Promise.all([reply('19.11.2026', second), reply('18.11.2026', first)])
+  await Promise.all([reply('19.11.2026', second), reply('в понедельник, 18 ноября', first)])
 
   const firstEdit = calls.findLast(
     ({ message }) => message?.message_id === initial.message.message_id,
@@ -2167,7 +2779,8 @@ test('date drafts bind separate replies and expire independently, including on a
   const secondEdit = calls.findLast(({ message }) => message?.message_id === photoId)
   assert.ok(firstEdit?.message)
   assert.ok(secondEdit?.message)
-  assert.match(firstEdit.message.text, /18 ноября/u)
+  assert.match(firstEdit.message.text, /Уточните дату/u)
+  assert.ok(buttons(firstEdit.payload).some(({ text }) => text === 'среда, 18 ноября'))
   assert.match(secondEdit.message.text, /19 ноября/u)
   assert.equal(secondEdit.method, 'editMessageCaption')
 
@@ -2175,11 +2788,66 @@ test('date drafts bind separate replies and expire independently, including on a
   assert.match((calls.at(-1)?.payload as { text: string }).text, /недоступно/u)
 
   t.mock.timers.setTime(start + 30 * 60_000)
-  await press('✅ Записать', { message: firstEdit.message, payload: firstEdit.payload })
+  await press('среда, 18 ноября', { message: firstEdit.message, payload: firstEdit.payload })
   assert.match((calls.at(-1)?.payload as { text: string }).text, /недоступно/u)
-  await press('✅ Сохранить дату', { message: secondEdit.message, payload: secondEdit.payload })
   assert.deepEqual(writes, ['2026-11-19'])
-  assert.equal(latestMessage().message.message_id, photoId)
-  assert.equal(calls.findLast(({ message }) => message)?.method, 'editMessageCaption')
-  assert.match(latestMessage().message.text, /Кафе\n📅 четверг, 19 ноября/u)
+  assert.match(secondEdit.message.text, /Кафе\n📅 четверг, 19 ноября/u)
+})
+
+test('batch preview keeps an extra amount uncategorized and saves only once after confirmation', async () => {
+  const submissions: Parameters<NonNullable<TelegramInput['submitBatch']>>[0][] = []
+  const { dispatch, latestMessage, press, reply, calls } = harness(
+    {},
+    true,
+    undefined,
+    undefined,
+    async (request) => {
+      submissions.push(request)
+      return {
+        status: 'saved',
+        rows: request.rows.map((row) => ({
+          id: operationId,
+          kind: row.kind,
+          categoryId: row.categoryId,
+          categoryName: null,
+          replayed: false,
+          deleted: false,
+        })),
+      }
+    },
+  )
+  await dispatch(datedText('Вчера кофе 250, сегодня ещё 300'))
+  assert.match(latestMessage().message.text, /Черновик операций/u)
+  assert.match(latestMessage().message.text, /300 ₽.*Без категории/u)
+  assert.equal(submissions.length, 0)
+
+  await press('Выбрать тип · 1')
+  await press('Изменить сумму или описание')
+  await reply('-270 кофе')
+  assert.match(latestMessage().message.text, /−270 ₽.*кофе/u)
+
+  const preview = latestMessage()
+  await Promise.all([press('Записать (2)', preview), press('Записать (2)', preview)])
+  assert.equal(submissions.length, 1)
+  assert.deepEqual(
+    submissions[0]?.rows.map((row) => [
+      row.amountKopecks,
+      row.description,
+      row.kind,
+      row.categoryId,
+      row.operationDate?.date,
+    ]),
+    [
+      ['27000', 'кофе', 'expense', null, '2026-11-20'],
+      ['30000', '', 'expense', null, '2026-11-21'],
+    ],
+  )
+  assert.match(latestMessage().message.text, /Записано операций: 2/u)
+  assert.ok(
+    calls.some(
+      ({ method, payload }) =>
+        method === 'answerCallbackQuery' &&
+        (payload as { text?: string }).text === 'Операции уже записаны.',
+    ),
+  )
 })

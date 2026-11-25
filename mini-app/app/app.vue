@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import { ToastProvider } from 'reka-ui'
+
 provideTelegramWebApp()
 useHead({ bodyAttrs: { class: 'analytics-viewport' } })
 
 const pageTransition = {
   name: 'analytics-page',
-  mode: 'out-in',
   onEnter(page: Element) {
     page.scrollTop = 0
   },
@@ -12,12 +13,15 @@ const pageTransition = {
 </script>
 
 <template>
-  <div class="analytics-pages">
-    <NuxtPage
-      :page-key="(route) => String(route.name)"
-      :keepalive="{ max: 3 }"
-      :transition="pageTransition"
-    />
-  </div>
-  <AnalyticsNavigation />
+  <ToastProvider label="Уведомление" :duration="2000" disable-swipe>
+    <div class="analytics-pages">
+      <NuxtPage
+        :page-key="(route) => String(route.name)"
+        :keepalive="{ max: 5 }"
+        :transition="pageTransition"
+      />
+    </div>
+    <AnalyticsNavigation />
+    <UiMessages />
+  </ToastProvider>
 </template>

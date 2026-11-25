@@ -4,7 +4,7 @@ export const periods = [
 ] as const
 
 export type PresetPeriod = (typeof periods)[number]['value']
-export type CustomPeriodMode = 'month' | 'week' | 'range'
+export type CustomPeriodMode = 'month' | 'week' | 'day' | 'range'
 export type CustomPeriod = {
   period: 'custom'
   mode: CustomPeriodMode
@@ -38,7 +38,7 @@ export type MonthlyBudget = {
 }
 
 export type AnalyticsOverview = {
-  period: PeriodSelection['period']
+  period: PeriodSelection['period'] | 'previous-month'
   startDate: string
   endDate: string
   timeZone: string

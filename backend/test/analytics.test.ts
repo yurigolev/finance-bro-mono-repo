@@ -2,12 +2,96 @@ import assert from 'node:assert/strict'
 import { createHmac, randomInt, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { test } from 'node:test'
-import { createAnalyticsServer } from '../src/analytics/http.ts'
-import { createAnalyticsOverview } from '../src/analytics/service.ts'
-import type { AnalyticsOverview } from '../src/analytics/types.ts'
-import { createApplication } from '../src/app.ts'
-import { createDatabase } from '../src/db/client.ts'
-import { readTimeZone } from '../src/users/repository.ts'
+import { starterCategories } from '../packages/shared/categories/starter-categories.ts'
+import { createAnalyticsServer } from '../services/core/analytics/http.ts'
+import { createAnalyticsOverview } from '../services/core/analytics/service.ts'
+import type { AnalyticsOverview } from '../services/core/analytics/types.ts'
+import { createApplication } from '../services/core/app.ts'
+import { createDatabase } from '../services/core/db/client.ts'
+import { createTransactionsHandler } from '../services/core/transactions/http.ts'
+import { readTimeZone } from '../services/core/users/repository.ts'
+
+test('Mini App history isolates users and records a backdated operation once across concurrent retries', async (t) => {
+  assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to a migrated test database')
+  const { db, pool } = createDatabase(process.env.DATABASE_URL)
+  t.after(() => pool.end())
+  const {
+    analytics,
+    telegram: { users, categories, transactions },
+  } = createApplication(db)
+  const telegramId = randomInt(2 ** 40, 2 ** 41)
+  const owner = await users.getOrCreateUser(telegramId)
+  const other = await users.getOrCreateUser(telegramId + 1)
+  await users.setTimeZone(owner, 'Asia/Yekaterinburg')
+  const [category] = await categories.listCategories(owner, 'expense')
+  const [foreignCategory] = await categories.listCategories(other, 'expense')
+
+  const now = new Date('2026-11-30T20:00:00Z')
+  const botToken = '1000000:synthetic-test-token'
+  const server = createAnalyticsServer({
+    botToken,
+    now: () => now,
+    ...analytics,
+    handleTransactions: createTransactionsHandler(db, users),
+  })
+  server.listen(0, '127.0.0.1')
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const endpoint = `http://127.0.0.1:${address.port}/api/transactions`
+
+  const operation = {
+    requestId: randomUUID(),
+    kind: 'expense',
+    amountKopecks: '41050',
+    description: 'Тестовый расход',
+    date: '2026-11-30',
+    categoryId: category.id,
+  }
+
+  function request(id: number, query = '', body?: typeof operation) {
+    const authDate = String(Math.floor(now.getTime() / 1000))
+    const user = JSON.stringify({ id })
+    const key = createHmac('sha256', 'WebAppData').update(botToken).digest()
+    const hash = createHmac('sha256', key)
+      .update(`auth_date=${authDate}\nuser=${user}`)
+      .digest('hex')
+    const initData = new URLSearchParams({ user, auth_date: authDate, hash }).toString()
+    return fetch(endpoint + query, {
+      method: body ? 'POST' : 'GET',
+      headers: { 'X-Telegram-Init-Data': initData, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+  }
+
+  assert.equal((await fetch(endpoint)).status, 401)
+  assert.equal(
+    (await request(telegramId, '', { ...operation, categoryId: foreignCategory.id })).status,
+    409,
+  )
+  assert.equal((await request(telegramId, '', { ...operation, date: '2026-12-02' })).status, 400)
+  const saves = await Promise.all([
+    request(telegramId, '', operation),
+    request(telegramId, '', operation),
+  ])
+  assert.deepEqual(
+    saves.map((response) => response.status),
+    [204, 204],
+  )
+  const current = await (await request(telegramId)).json()
+  assert.equal(current.month, '2026-12')
+  assert.deepEqual(current.operations, [])
+  const history = await (await request(telegramId, '?month=2026-11')).json()
+  assert.equal(history.operations.length, 1)
+  assert.equal(history.operations[0].date, operation.date)
+  assert.equal(history.operations[0].amountKopecks, operation.amountKopecks)
+  assert.equal(history.operations[0].time, null)
+  assert.equal(history.operations[0].categoryName, category.name)
+  assert.deepEqual((await (await request(telegramId + 1, '?month=2026-11')).json()).operations, [])
+  const stored = await transactions.getOperation(owner, history.operations[0].id)
+  assert.equal(stored?.operationDate.date, operation.date)
+})
 
 test('the saved profile time zone controls the active month without rewriting operations', async (t) => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to a migrated test database')
@@ -285,6 +369,22 @@ test('PostgreSQL analytics match bot dates across a repeated midnight and separa
     expenseKopecks: '617',
     differenceKopecks: '383',
   })
+  const zeroExpenseCategories = [
+    { id: bar, name: 'Бар', amountKopecks: '0' },
+    { id: activeCafe, name: 'Кафе', amountKopecks: '0' },
+  ]
+  assert.deepEqual(previous.expenseCategories, [
+    { id: null, name: 'Без категории', amountKopecks: '617' },
+    ...zeroExpenseCategories,
+  ])
+
+  const emptyDay = await analytics.loadOverview(owner, 'custom', now, {
+    startDate: '2020-10-28',
+    endDate: '2020-10-28',
+  })
+  assert.equal(emptyDay.totals.expenseKopecks, '0')
+  assert.deepEqual(emptyDay.expenseCategories, zeroExpenseCategories)
+  assert.deepEqual(emptyDay.expenseCategoriesByDay, {})
 
   const threeMonths = await analytics.loadOverview(owner, 'custom', now, {
     startDate: '2020-10-31',
@@ -318,7 +418,12 @@ test('PostgreSQL analytics match bot dates across a repeated midnight and separa
     expenseKopecks: '0',
     differenceKopecks: '777',
   })
-  assert.deepEqual(isolated.expenseCategories, [])
+  const starterExpenses = starterCategories.expense.map(({ key, name }) => ({
+    id: `starter:${key}`,
+    name,
+    amountKopecks: '0',
+  }))
+  assert.deepEqual(isolated.expenseCategories, starterExpenses)
   assert.deepEqual(isolated.budget, {
     month: '2020-11-01',
     spentKopecks: '0',
@@ -328,6 +433,7 @@ test('PostgreSQL analytics match bot dates across a repeated midnight and separa
 
   const empty = await overview('current-month', telegramId + 2, owner)
   assert.equal(empty.operationCount, 0)
+  assert.deepEqual(empty.expenseCategories, starterExpenses)
   assert.deepEqual(empty.totals, {
     incomeKopecks: '0',
     expenseKopecks: '0',
@@ -393,7 +499,7 @@ test('analytics use a single snapshot after concurrent changes to profile, budge
   const { db, pool } = createDatabase(process.env.DATABASE_URL)
   t.after(() => pool.end())
   const {
-    telegram: { users, transactions, budgets },
+    telegram: { users, transactions, budgets, categories },
     analytics: { loadOverview },
   } = createApplication(db)
   const owner = await users.getOrCreateUser(randomInt(2 ** 40, 2 ** 41))
@@ -441,5 +547,9 @@ test('analytics use a single snapshot after concurrent changes to profile, budge
   assert.equal(after.days.at(-1)?.expenseKopecks, '100')
   assert.deepEqual(after.expenseCategories, [
     { id: null, name: 'Без категории', amountKopecks: '100' },
+    ...(await categories.listCategories(owner, 'expense')).map((category) => ({
+      ...category,
+      amountKopecks: '0',
+    })),
   ])
 })

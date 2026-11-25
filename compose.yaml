@@ -2,6 +2,7 @@ name: financebro
 
 services:
   db:
+    container_name: ${COMPOSE_PROJECT_NAME}-postgres
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: financebro
@@ -18,6 +19,7 @@ services:
     restart: unless-stopped
 
   migrate:
+    container_name: ${COMPOSE_PROJECT_NAME}-db-migrate
     build:
       context: ./backend
       target: tools
@@ -29,25 +31,75 @@ services:
       db:
         condition: service_healthy
 
-  bot:
-    build: ./backend
+  core:
+    container_name: ${COMPOSE_PROJECT_NAME}-financial-core
+    build:
+      context: ./backend
+      target: core-runtime
     environment:
       BOT_TOKEN: ${BOT_TOKEN:-}
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
-      WHISPER_URL: http://whisper:8080/inference
+      CORE_SERVICE_TOKEN: ${CORE_SERVICE_TOKEN:?set CORE_SERVICE_TOKEN in .env}
       ANALYTICS_HTTP_HOST: 0.0.0.0
       ANALYTICS_HTTP_PORT: ${ANALYTICS_HTTP_PORT:-8787}
       ANALYTICS_INIT_DATA_MAX_AGE_SECONDS: ${ANALYTICS_INIT_DATA_MAX_AGE_SECONDS:-3600}
     depends_on:
       migrate:
         condition: service_completed_successfully
-      db:
+    networks: [database, backend, frontend]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:' + process.env.ANALYTICS_HTTP_PORT + '/api/analytics/overview', {signal: AbortSignal.timeout(1500)}).then(r => process.exit(r.status === 401 ? 0 : 1), () => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    init: true
+    restart: unless-stopped
+
+  bot:
+    container_name: ${COMPOSE_PROJECT_NAME}-telegram-bot
+    build:
+      context: ./backend
+      target: bot-runtime
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      CORE_URL: http://core:${ANALYTICS_HTTP_PORT:-8787}
+      CORE_SERVICE_TOKEN: ${CORE_SERVICE_TOKEN:?set CORE_SERVICE_TOKEN in .env}
+      INPUT_URL: http://input:8788
+      INPUT_SERVICE_TOKEN: ${INPUT_SERVICE_TOKEN:?set INPUT_SERVICE_TOKEN in .env}
+    depends_on:
+      core:
         condition: service_healthy
-    networks: [database, telegram, speech, frontend]
+      input:
+        condition: service_healthy
+    networks: [backend, input-api, telegram]
+    stop_grace_period: 90s
+    init: true
+    restart: unless-stopped
+
+  input:
+    container_name: ${COMPOSE_PROJECT_NAME}-input-parser
+    build:
+      context: ./backend
+      target: input-runtime
+    environment:
+      INPUT_SERVICE_TOKEN: ${INPUT_SERVICE_TOKEN:?set INPUT_SERVICE_TOKEN in .env}
+      INPUT_CLIENT_TOKENS: ${INPUT_CLIENT_TOKENS:-}
+      INPUT_HTTP_HOST: 0.0.0.0
+      INPUT_HTTP_PORT: 8788
+      WHISPER_URL: http://whisper:8080/inference
+    networks: [input-api, speech]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:' + process.env.INPUT_HTTP_PORT + '/health', {signal: AbortSignal.timeout(1500)}).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    tmpfs:
+      - /tmp
     init: true
     restart: unless-stopped
 
   whisper-model:
+    container_name: ${COMPOSE_PROJECT_NAME}-whisper-model
     build:
       context: ./backend
       dockerfile: Dockerfile.whisper
@@ -68,6 +120,7 @@ services:
       - whisper-model:/models
 
   whisper:
+    container_name: ${COMPOSE_PROJECT_NAME}-whisper
     build:
       context: ./backend
       dockerfile: Dockerfile.whisper
@@ -89,23 +142,29 @@ services:
     restart: unless-stopped
 
   mini-app:
+    container_name: ${COMPOSE_PROJECT_NAME}-mini-app
     profiles: [mini-app]
     build: ./mini-app
     environment:
       ANALYTICS_LISTEN: '80'
-      ANALYTICS_API_UPSTREAM: bot:${ANALYTICS_HTTP_PORT:-8787}
+      ANALYTICS_API_UPSTREAM: core:${ANALYTICS_HTTP_PORT:-8787}
       ANALYTICS_STATIC_ROOT: /usr/share/nginx/html
       ANALYTICS_DNS_DIRECTIVE: resolver 127.0.0.11 valid=10s ipv6=off;
       NGINX_ENVSUBST_FILTER: ^ANALYTICS_
     ports:
       - '127.0.0.1:${MINI_APP_PORT:-8081}:80'
     depends_on:
-      - bot
+      core:
+        condition: service_healthy
     networks: [frontend]
     restart: unless-stopped
 
 networks:
   database:
+    internal: true
+  backend:
+    internal: true
+  input-api:
     internal: true
   telegram:
   speech:

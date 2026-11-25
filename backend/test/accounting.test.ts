@@ -3,11 +3,11 @@ import { randomInt, randomUUID } from 'node:crypto'
 import { test, type TestContext } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { and, eq } from 'drizzle-orm'
-import { createApplication } from '../src/app.ts'
-import { createDatabase } from '../src/db/client.ts'
-import { transactions } from '../src/db/schema.ts'
-import { insertOperation } from '../src/transactions/repository.ts'
-import type { RecordOperationResult } from '../src/transactions/types.ts'
+import { createApplication } from '../services/core/app.ts'
+import { createDatabase } from '../services/core/db/client.ts'
+import { transactions } from '../services/core/db/schema.ts'
+import { insertOperation } from '../services/core/transactions/repository.ts'
+import type { RecordOperationResult } from '../packages/contracts/transactions.ts'
 
 function connect(t: TestContext, connectionString = process.env.DATABASE_URL) {
   assert.ok(connectionString, 'DATABASE_URL must point to a migrated test database')

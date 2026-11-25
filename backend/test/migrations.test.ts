@@ -6,11 +6,11 @@ import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { migrate } from 'drizzle-orm/node-postgres/migrator'
-import { createApplication } from '../src/app.ts'
-import { createDatabase } from '../src/db/client.ts'
-import { insertOperation } from '../src/transactions/repository.ts'
+import { createApplication } from '../services/core/app.ts'
+import { createDatabase } from '../services/core/db/client.ts'
+import { insertOperation } from '../services/core/transactions/repository.ts'
 
-const migrationsFolder = fileURLToPath(new URL('../drizzle/', import.meta.url))
+const migrationsFolder = fileURLToPath(new URL('../services/core/drizzle/', import.meta.url))
 const migrationDatabaseUrl = process.env.MIGRATION_TEST_DATABASE_URL
 const skip =
   !migrationDatabaseUrl &&
@@ -86,6 +86,32 @@ async function migrationPrefix(t: TestContext, lastTag: string) {
   )
   return initialFolder
 }
+
+test(
+  'description migration allows a bare amount and preserves existing descriptions',
+  { skip },
+  async (t) => {
+    const { db } = await createTestDatabase(t)
+    await migrate(db, { migrationsFolder: await migrationPrefix(t, '0009_move_gifts_to_expenses') })
+
+    const { users, transactions } = createApplication(db).telegram
+    const owner = await users.getOrCreateUser(123)
+    const existing = { kind: 'expense', amountKopecks: 48_000n, description: 'кофе' } as const
+    const existingId = await insertOperation(db, owner, existing, 'telegram:1')
+
+    await migrate(db, { migrationsFolder })
+
+    const saved = await transactions.recordOperation(
+      owner,
+      { kind: 'income', amountKopecks: 1_000_000n, description: '' },
+      'telegram:2',
+    )
+    assert.equal(saved.status, 'created')
+    const recent = await transactions.recent(owner)
+    assert.equal(recent.find(({ kind }) => kind === 'income')?.description, '')
+    assert.equal(recent.find(({ id }) => id === existingId)?.description, 'кофе')
+  },
+)
 
 test('budget migration preserves operations and constrains monthly limits', { skip }, async (t) => {
   const { db, pool } = await createTestDatabase(t)

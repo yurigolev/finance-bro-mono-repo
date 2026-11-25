@@ -4,8 +4,8 @@ import {
   builtInGroup,
   normalizeBuiltInWord,
   starterCategories,
-} from '../src/categories/starter-categories.ts'
-import { parseOperation } from '../src/telegram/parsing/parser.ts'
+} from '../packages/shared/categories/starter-categories.ts'
+import { parseOperation } from '../services/input/parsing/parser.ts'
 
 test('parses spoken amounts without assigning an operation kind', () => {
   const examples = [
@@ -13,6 +13,8 @@ test('parses spoken amounts without assigning an operation kind', () => {
     ['Я потратила 250 ₽ на кофе.', 25_000n, 'кофе'],
     ['На кофе потратил 250 рублей.', 25_000n, 'кофе'],
     ['Такси стоило 450 рублей 5 копеек.', 45_005n, 'такси'],
+    ['Такси стоило\n450 рублей 5 копеек.', 45_005n, 'такси'],
+    ['кофе\nчай 350', 35_000n, 'кофе чай'],
     ['Купила две тысячи триста пятьдесят рублей на продукты', 235_000n, 'продукты'],
     ['Кофе 250,50', 25_050n, 'Кофе'],
     ['Получил три тысячи рублей за проект.', 300_000n, 'проект'],
@@ -38,23 +40,44 @@ test('rejects unsupported or ambiguous spoken amounts', () => {
     assert.equal(parseOperation(text), null, text)
 })
 
-test('reads the same amount and description with or without a sign', () => {
-  for (const sign of ['', '+', '-', '−']) {
-    assert.deepEqual(parseOperation(`${sign}20000 зарплата`), {
-      amountKopecks: 2_000_000n,
-      description: 'зарплата',
-    })
+test('reads an explicit kind from the sign before the amount', () => {
+  for (const [text, amountKopecks, description, kind] of [
+    ['+1000 ыы', 100_000n, 'ыы', 'income'],
+    ['+ 10000 sss', 1_000_000n, 'sss', 'income'],
+    ['- 20000 зарплата', 2_000_000n, 'зарплата', 'expense'],
+    ['кофе − 480', 48_000n, 'кофе', 'expense'],
+  ] as const) {
+    assert.deepEqual(parseOperation(text), { amountKopecks, description, kind }, text)
   }
+})
+
+test('accepts amounts without a description', () => {
+  assert.deepEqual(parseOperation('480'), { amountKopecks: 48_000n, description: '' })
+  assert.deepEqual(parseOperation('1 200'), { amountKopecks: 120_000n, description: '' })
+  assert.deepEqual(parseOperation('40к'), { amountKopecks: 4_000_000n, description: '' })
+  assert.deepEqual(parseOperation('40 тыс.'), { amountKopecks: 4_000_000n, description: '' })
+  assert.deepEqual(parseOperation('+ 10000'), {
+    amountKopecks: 1_000_000n,
+    description: '',
+    kind: 'income',
+  })
+  assert.deepEqual(parseOperation('-480,50'), {
+    amountKopecks: 48_050n,
+    description: '',
+    kind: 'expense',
+  })
 })
 
 test('preserves exact kopecks and trims surrounding whitespace', () => {
   assert.deepEqual(parseOperation('  -480,5   кофе с молоком  '), {
     amountKopecks: 48_050n,
     description: 'кофе с молоком',
+    kind: 'expense',
   })
   assert.deepEqual(parseOperation('+0.01 возврат'), {
     amountKopecks: 1n,
     description: 'возврат',
+    kind: 'income',
   })
   assert.equal(
     parseOperation('92233720368547758.07 верхняя граница')?.amountKopecks,
@@ -86,10 +109,12 @@ test('reads amounts with grouped thousands in either position', () => {
   assert.deepEqual(parseOperation('зарплата +1\u00a0234\u202f567,89'), {
     amountKopecks: 123_456_789n,
     description: 'зарплата',
+    kind: 'income',
   })
   assert.deepEqual(parseOperation('−15\u202f000.5 за квартиру'), {
     amountKopecks: 1_500_050n,
     description: 'за квартиру',
+    kind: 'expense',
   })
   assert.equal(
     parseOperation('92 233 720 368 547 758,07 предел')?.amountKopecks,
@@ -111,39 +136,34 @@ test('expands abbreviated thousands in either position', () => {
   assert.deepEqual(parseOperation('проект +1,5К'), {
     amountKopecks: 150_000n,
     description: 'проект',
+    kind: 'income',
   })
   assert.deepEqual(parseOperation('−1.25\u00a0тыс. к врачу'), {
     amountKopecks: 125_000n,
     description: 'к врачу',
+    kind: 'expense',
   })
   assert.equal(parseOperation('40 к врачу')?.description, 'к врачу')
   assert.equal(parseOperation('40 к врачу')?.amountKopecks, 4_000n)
 })
 
-test('asks for clarification on ambiguous or invalid amounts and missing descriptions', () => {
+test('asks for clarification on ambiguous or invalid amounts', () => {
   const invalid = [
     '',
-    '480',
-    '+ 480 кофе',
     '480,001 кофе',
     '0 кофе',
     'кофе 0',
     'кофе 480,001',
-    'кофе + 480',
     'квартира 40 50',
     'квартира 40 50 000',
     'квартира 40 000,005',
     'кофе +480 чай 350',
-    'кофе\nчай 350',
-    '1 200',
     'кофе 92233720368547758.08',
     '15 00 проект',
     '15\u202f00 проект',
     '480 кофе +15 000 чай',
     '480 кофе\n350 чай',
     'предел 92 233 720 368 547 758,08',
-    '40к',
-    '40 тыс.',
     'квартира 0к',
     'квартира 1,005к',
     'кофе +1к чай 350',

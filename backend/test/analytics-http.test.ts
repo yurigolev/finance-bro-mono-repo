@@ -2,9 +2,11 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import { once } from 'node:events'
 import { test } from 'node:test'
-import { createAnalyticsServer } from '../src/analytics/http.ts'
-import { createInitDataVerifier } from '../src/analytics/init-data.ts'
-import type { AnalyticsPeriod, AnalyticsRange } from '../src/analytics/types.ts'
+import { createSettingsHandler } from '../services/core/settings/http.ts'
+import type { TelegramDependencies } from '../packages/contracts/telegram-dependencies.ts'
+import { createAnalyticsServer } from '../services/core/analytics/http.ts'
+import { createInitDataVerifier } from '../services/core/analytics/init-data.ts'
+import type { AnalyticsPeriod, AnalyticsRange } from '../services/core/analytics/types.ts'
 
 const botToken = '1000000:synthetic-test-token'
 const now = new Date('2026-11-21T00:15:00Z')
@@ -166,4 +168,114 @@ test('analytics route authenticates the owner, validates the period and keeps se
     logger.mock.calls.map(({ arguments: args }) => args),
     Array.from({ length: 3 }, () => ['Не удалось загрузить аналитику.']),
   )
+})
+
+test('settings authenticate the owner and route validated changes to the bot services', async (t) => {
+  const categoryId = '20000000-0000-4000-8000-000000000000'
+  const ruleId = '30000000-0000-4000-8000-000000000000'
+  const expectedCalls: unknown[][] = []
+  const dependencies: Pick<TelegramDependencies, 'users' | 'categories'> = {
+    users: {
+      getOrCreateUser: async (id) => {
+        assert.equal(id, telegramId)
+        return ownerId
+      },
+      getTimeZone: async () => 'Asia/Yekaterinburg',
+      setTimeZone: async (...args) => {
+        expectedCalls.push(args)
+        return { timeZone: args[1] }
+      },
+    },
+    categories: {
+      listCategories: async () => [],
+      listBuiltInTargets: async () => [],
+      listCategoryRules: async () => [],
+      getBuiltInRule: async () => null,
+      setCategory: async () => false,
+      canRememberCategory: async () => false,
+      rememberCategory: async () => false,
+      addCategory: async (...args) => {
+        expectedCalls.push(args)
+        return 'ok'
+      },
+      renameCategory: async (...args) => {
+        expectedCalls.push(args)
+        return 'duplicate'
+      },
+      archiveCategory: async (...args) => {
+        expectedCalls.push(args)
+        return false
+      },
+      deleteCategoryRule: async (...args) => {
+        expectedCalls.push(args)
+        return true
+      },
+      changeBuiltInRule: async (...args) => {
+        expectedCalls.push(args)
+        return true
+      },
+      bindBuiltInGroup: async (...args) => {
+        expectedCalls.push(args)
+        return true
+      },
+    },
+  }
+  const server = createAnalyticsServer({
+    botToken,
+    now: () => now,
+    resolveUserId: async () => {
+      throw new Error('Unexpected analytics request')
+    },
+    loadOverview: async () => {
+      throw new Error('Unexpected analytics request')
+    },
+    handleSettings: createSettingsHandler(dependencies),
+  })
+  server.listen(0, '127.0.0.1')
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const url = `http://127.0.0.1:${address.port}/api/settings?userId=ignored`
+  const headers = { 'X-Telegram-Init-Data': launchData(), 'Content-Type': 'application/json' }
+  const get = await fetch(url, { headers })
+  assert.equal(get.status, 200)
+  assert.equal(get.headers.get('cache-control'), 'no-store')
+  const data = await get.json()
+  assert.equal(data.timeZone, 'Asia/Yekaterinburg')
+  assert.ok(data.groups.some((group: { words: string[] }) => group.words.includes('кофе')))
+
+  const reset = { action: 'time-zone', timeZone: null, userId: 'ignored' }
+  const unauthenticated = await fetch(url, { method: 'PATCH', body: JSON.stringify(reset) })
+  assert.equal(unauthenticated.status, 401)
+  const malformed = await fetch(url, { method: 'PATCH', headers, body: '{' })
+  assert.equal(malformed.status, 400)
+  const oversized = await fetch(url, { method: 'PATCH', headers, body: 'x'.repeat(4097) })
+  assert.equal(oversized.status, 413)
+  assert.deepEqual(expectedCalls, [])
+
+  const changes = [
+    [reset, 204],
+    [{ action: 'add-category', kind: 'expense', name: 'Тест' }, 204],
+    [{ action: 'rename-category', id: categoryId, name: 'Другое' }, 409],
+    [{ action: 'archive-category', id: categoryId }, 409],
+    [{ action: 'delete-rule', id: ruleId, categoryId: null }, 204],
+    [{ action: 'change-word', kind: 'expense', word: 'кофе', target: 'reset' }, 204],
+    [{ action: 'bind-group', kind: 'expense', key: 'cafes', categoryId }, 204],
+  ] as const
+  for (const [change, status] of changes) {
+    const result = await fetch(url, { method: 'PATCH', headers, body: JSON.stringify(change) })
+    assert.equal(result.status, status)
+    assert.equal(result.headers.get('cache-control'), 'no-store')
+    await result.text()
+  }
+  assert.deepEqual(expectedCalls, [
+    [ownerId, null],
+    [ownerId, 'expense', 'Тест'],
+    [ownerId, categoryId, 'Другое'],
+    [ownerId, categoryId],
+    [ownerId, ruleId, null],
+    [ownerId, 'expense', 'кофе', 'reset'],
+    [ownerId, 'expense', 'cafes', categoryId],
+  ])
 })

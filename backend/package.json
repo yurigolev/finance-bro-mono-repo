@@ -9,24 +9,19 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "start": "node dist/main.js",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
-    "test": "node --test test/parser.test.ts test/telegram.test.ts test/analytics-http.test.ts",
-    "test:integration": "node --test test/accounting.test.ts test/migrations.test.ts test/analytics.test.ts"
-  },
-  "dependencies": {
-    "@grammyjs/runner": "2.0.3",
-    "drizzle-orm": "0.45.4",
-    "grammy": "1.46.0",
-    "multilingual-stemmer": "^2.2.1",
-    "pg": "8.23.1",
-    "zod": "4.6.7"
+    "start": "node dist/services/bot/main.js",
+    "db:generate": "drizzle-kit generate --config services/core/drizzle.config.ts",
+    "db:migrate": "drizzle-kit migrate --config services/core/drizzle.config.ts",
+    "test": "node --test test/parser.test.ts test/telegram.test.ts test/analytics-http.test.ts test/input.test.ts",
+    "test:integration": "node --test test/accounting.test.ts test/migrations.test.ts test/analytics.test.ts test/structured-operations.test.ts test/input-context.test.ts test/telegram-core-http.test.ts test/operation-input-client.test.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/pg": "^8.0.0",
     "drizzle-kit": "0.31.11",
     "typescript": "7.0.2"
-  }
+  },
+  "workspaces": [
+    "services/*"
+  ]
 }

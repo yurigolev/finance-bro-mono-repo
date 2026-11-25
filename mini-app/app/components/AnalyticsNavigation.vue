@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ChartNoAxesColumnIncreasing, House, Wallet } from '@lucide/vue'
+import { ChartNoAxesColumnIncreasing, Clock, House, Settings, Wallet } from '@lucide/vue'
 
 const destinations = [
   { path: '/', label: 'Обзор', icon: House },
+  { path: '/history', label: 'История', icon: Clock },
   { path: '/comparison', label: 'Сравнение', icon: ChartNoAxesColumnIncreasing },
   { path: '/budgets', label: 'Бюджеты', icon: Wallet },
+  { path: '/settings', label: 'Настройки', icon: Settings },
 ]
 
 const route = useRoute()
@@ -17,9 +19,9 @@ const activeIndex = computed(() => {
 
 <template>
   <nav
-    class="analytics-dock"
-    aria-label="Разделы аналитики"
-    :style="{ '--active-tab': Math.max(activeIndex, 0) }"
+    class="analytics-dock analytics-glass"
+    aria-label="Разделы мини-приложения"
+    :style="{ '--active-tab': Math.max(activeIndex, 0), '--tab-count': destinations.length }"
   >
     <div class="dock-links">
       <span v-if="activeIndex >= 0" class="dock-indicator" aria-hidden="true" />
@@ -45,33 +47,18 @@ const activeIndex = computed(() => {
   max-width: 420px;
   height: var(--analytics-dock-height);
   margin-inline: auto;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-color: color-mix(in srgb, var(--line) 58%, transparent);
+  padding: 5px;
   border-radius: var(--radius-pill);
-  background: var(--background);
   box-shadow:
-    0 6px 24px rgb(11 31 53 / 13%),
-    inset 0 1px 0 rgb(255 255 255 / 22%);
+    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight) 42%, transparent),
+    0 10px 24px color-mix(in srgb, var(--glass-shadow) 29%, transparent);
   isolation: isolate;
-}
-
-@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
-  .analytics-dock {
-    background: linear-gradient(
-      160deg,
-      color-mix(in srgb, var(--background) 87%, transparent),
-      color-mix(in srgb, var(--control) 71%, transparent)
-    );
-    -webkit-backdrop-filter: blur(18px) saturate(145%);
-    backdrop-filter: blur(18px) saturate(145%);
-  }
 }
 
 .dock-links {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--tab-count), minmax(0, 1fr));
   height: 100%;
 }
 
@@ -80,15 +67,19 @@ const activeIndex = computed(() => {
   z-index: -1;
   inset-block: 0;
   inset-inline-start: 0;
-  width: calc(100% / 3);
-  border: 1px solid color-mix(in srgb, var(--accent) 13%, transparent);
+  width: calc(100% / var(--tab-count));
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
   border-radius: var(--radius-pill);
+  background: var(--accent-surface);
   background: linear-gradient(
-    155deg,
-    color-mix(in srgb, var(--accent-surface) 88%, transparent),
-    color-mix(in srgb, var(--accent-surface) 64%, transparent)
+    147deg,
+    color-mix(in srgb, var(--accent) 25%, transparent),
+    color-mix(in srgb, var(--accent-surface) 58%, transparent) 44%,
+    color-mix(in srgb, var(--accent) 15%, transparent)
   );
-  box-shadow: inset 0 1px 1px rgb(255 255 255 / 26%);
+  box-shadow:
+    inset 0 1px 1px color-mix(in srgb, var(--glass-highlight) 64%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, var(--accent) 23%, transparent);
   transform: translateX(calc(var(--active-tab) * 100%));
   transition: transform 360ms cubic-bezier(0.22, 0.78, 0.22, 1);
   pointer-events: none;
@@ -100,10 +91,10 @@ const activeIndex = computed(() => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
+  gap: 3px;
   border-radius: var(--radius-pill);
   color: var(--muted);
-  font-size: 12px;
+  font-size: clamp(9px, 2.8vw, 12px);
   font-weight: 650;
   line-height: 1.15;
   text-decoration: none;

@@ -9,5 +9,5 @@
     "erasableSyntaxOnly": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "drizzle.config.ts"]
+  "include": ["services/**/*.ts", "packages/**/*.ts", "test/**/*.ts"]
 }

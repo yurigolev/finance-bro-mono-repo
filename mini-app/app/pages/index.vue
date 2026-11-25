@@ -9,30 +9,25 @@ import {
 } from '#shared/types/analytics'
 import UiSkeleton from '~/components/ui/UiSkeleton.vue'
 import UiSegmentedRadioGroup from '~/components/ui/UiSegmentedRadioGroup.vue'
-import {
-  formatDay,
-  formatDateRange,
-  formatKopecks,
-  formatMonthRange,
-} from '~/utils/analytics-format'
+import { formatDateRange, formatKopecks, formatMonthRange } from '~/utils/analytics-format'
 
 defineOptions({ name: 'AnalyticsOverviewPage' })
 definePageMeta({ alias: '/index.html', scrollToTop: false })
 
 const period = ref<PeriodSelection>({ period: 'current-month' })
+const { pending, run } = usePendingAction<PresetPeriod | 'previous' | 'next' | 'apply' | 'retry'>()
 const preset = computed({
   get: () => (period.value.period === 'custom' ? '' : period.value.period),
   set: (value: PresetPeriod | '') => {
-    if (value && value !== period.value.period) period.value = { period: value }
+    if (value && value !== period.value.period) void changePeriod(value, { period: value })
   },
 })
-const categoryDate = ref('')
 const categoryKind = ref<CategoryKind>('expense')
 const categoryOptions = [
   { value: 'income', label: 'Доходы' },
   { value: 'expense', label: 'Расходы' },
 ] as const
-const { state, selectedDate, load } = useAnalyticsOverview(period)
+const { state, load } = useAnalyticsOverview(period)
 const overview = computed(() => (state.value.status === 'ready' ? state.value.overview : undefined))
 const periodMode = computed(() =>
   period.value.period === 'custom'
@@ -47,9 +42,6 @@ const timeZone = ref('UTC')
 watch(overview, (value) => {
   if (value) timeZone.value = value.timeZone
 })
-const categoryDay = computed(() =>
-  overview.value?.days.find((day) => day.date === categoryDate.value),
-)
 const difference = computed(() =>
   overview.value ? BigInt(overview.value.totals.differenceKopecks) : 0n,
 )
@@ -62,10 +54,17 @@ function adjacentPeriod(direction: -1 | 1): PeriodSelection | undefined {
   if (!current || mode === 'range') return
 
   const start = parseDate(current.startDate)
+  const now = today(current.timeZone)
+  if (mode === 'day') {
+    const target = start.add({ days: direction })
+    if (target.compare(start) * direction <= 0 || target.compare(now) > 0) return
+    const date = target.toString()
+    return { period: 'custom', mode, startDate: date, endDate: date }
+  }
+
   const target = start.add(mode === 'month' ? { months: direction } : { weeks: direction })
   if (target.compare(start) * direction <= 0) return
 
-  const now = today(current.timeZone)
   const currentStart = mode === 'month' ? startOfMonth(now) : startOfWeek(now, 'ru-RU')
   const offset = target.compare(currentStart)
   if (offset > 0) return
@@ -80,51 +79,64 @@ function adjacentPeriod(direction: -1 | 1): PeriodSelection | undefined {
   }
 }
 
-function toggleCategoryDay(date: string) {
-  categoryDate.value = categoryDate.value === date ? '' : date
-}
-
 function refresh(background = false) {
   return load(initData, background)
 }
 
-watch(period, () => {
-  categoryDate.value = ''
-  refresh()
-})
+function changePeriod(
+  action: Exclude<NonNullable<typeof pending.value>, 'retry'>,
+  next: PeriodSelection,
+) {
+  return run(action, async () => {
+    await load(initData, false, next)
+    period.value = next
+  })
+}
 </script>
 
 <template>
-  <main class="analytics" aria-label="Аналитика">
+  <main
+    class="analytics"
+    :class="{ 'overview-with-period': state.status !== 'telegram-required' }"
+    aria-label="Аналитика"
+  >
     <template v-if="state.status === 'telegram-required'">
       <p class="message" role="status">Откройте аналитику из меню бота</p>
     </template>
 
     <template v-else>
-      <div class="period-picker">
-        <UiSegmentedRadioGroup
-          v-model="preset"
-          :options="periods"
-          aria-label="Быстрый выбор периода"
-        />
-        <PeriodDialog
-          :selection="period.period === 'custom' ? period : undefined"
-          :time-zone="timeZone"
-          @apply="period = $event"
-        />
-      </div>
-
-      <div v-if="state.status === 'error'" class="error-state">
-        <p class="message" role="alert">Не удалось загрузить аналитику</p>
-        <button class="retry" type="button" @click="refresh()">Повторить</button>
-      </div>
-
-      <div v-else :aria-busy="state.status === 'loading'">
+      <div class="overview-period" role="group" aria-label="Период обзора">
+        <div class="period-picker">
+          <UiSegmentedRadioGroup
+            v-model="preset"
+            class="analytics-glass"
+            :options="periods"
+            :pending="
+              pending === 'current-month' || pending === 'current-week' ? pending : undefined
+            "
+            :disabled="!!pending"
+            aria-label="Быстрый выбор периода"
+          />
+          <PeriodDialog
+            glass-trigger
+            :selection="period.period === 'custom' ? period : undefined"
+            :time-zone="timeZone"
+            :disabled="!!pending"
+            :loading="pending === 'apply'"
+            @apply="changePeriod('apply', $event)"
+          />
+        </div>
         <PeriodNavigation
+          v-if="state.status !== 'error' && pending !== 'retry'"
+          class="analytics-glass"
           :has-previous="!!previousPeriod"
           :has-next="!!nextPeriod"
-          @previous="previousPeriod && (period = previousPeriod)"
-          @next="nextPeriod && (period = nextPeriod)"
+          :previous-label="periodMode === 'day' ? 'Предыдущий день' : undefined"
+          :next-label="periodMode === 'day' ? 'Следующий день' : undefined"
+          :pending="pending === 'previous' || pending === 'next' ? pending : undefined"
+          :disabled="!!pending"
+          @previous="previousPeriod && changePeriod('previous', previousPeriod)"
+          @next="nextPeriod && changePeriod('next', nextPeriod)"
         >
           <template v-if="overview">{{
             periodMode === 'month'
@@ -133,7 +145,16 @@ watch(period, () => {
           }}</template>
           <UiSkeleton v-else class="range-placeholder" />
         </PeriodNavigation>
+      </div>
 
+      <div v-if="state.status === 'error' || pending === 'retry'" class="error-state">
+        <p class="message" role="alert">Не удалось загрузить аналитику</p>
+        <UiAsyncButton class="retry" :loading="pending === 'retry'" @click="run('retry', refresh)">
+          Повторить
+        </UiAsyncButton>
+      </div>
+
+      <div v-else :aria-busy="state.status === 'loading'">
         <section class="analytics-section totals" aria-label="Итоги за период">
           <dl class="metric-list">
             <div
@@ -189,42 +210,30 @@ watch(period, () => {
 
         <section class="analytics-section" aria-labelledby="days-heading">
           <h2 id="days-heading">По дням</h2>
-          <DayChart
-            v-if="overview"
-            v-model="selectedDate"
-            :days="overview.days"
-            @select-day="toggleCategoryDay"
-          />
+          <DayChart v-if="overview" :days="overview.days" />
           <div v-else class="day-placeholder">
             <UiSkeleton class="legend-placeholder" />
             <UiSkeleton class="plot-placeholder" />
-            <UiSkeleton class="range-placeholder" />
           </div>
         </section>
 
         <section class="categories-section" aria-labelledby="categories-heading">
-          <h2 id="categories-heading">По категориям</h2>
-          <UiSegmentedRadioGroup
-            v-model="categoryKind"
-            :options="categoryOptions"
-            class="category-kind-control"
-            aria-label="Тип операций по категориям"
-          />
-          <div v-if="categoryDay" class="category-period">
-            <time :datetime="categoryDay.date">{{ formatDay(categoryDay.date) }}</time>
-            <button type="button" @click="categoryDate = ''">За весь период</button>
+          <div class="categories-header">
+            <h2 id="categories-heading">По категориям</h2>
+            <UiSegmentedRadioGroup
+              v-model="categoryKind"
+              :options="categoryOptions"
+              class="period-control-compact category-kind-control"
+              aria-label="Тип операций по категориям"
+            />
           </div>
           <CategoryBreakdown
             v-if="overview"
-            :key="`${categoryKind}:${categoryDay?.date ?? ''}`"
+            :key="categoryKind"
             :kind="categoryKind"
-            :categories="
-              categoryDay
-                ? (overview[`${categoryKind}CategoriesByDay`]?.[categoryDay.date] ?? [])
-                : (overview[`${categoryKind}Categories`] ?? [])
-            "
-            :total-kopecks="(categoryDay ?? overview.totals)[`${categoryKind}Kopecks`]"
-            :daily="!!categoryDay"
+            :categories="overview[`${categoryKind}Categories`]"
+            :total-kopecks="overview.totals[`${categoryKind}Kopecks`]"
+            :daily="periodMode === 'day'"
           />
           <div v-else class="categories-placeholder">
             <UiSkeleton v-for="index in 3" :key="index" class="category-placeholder" />
@@ -236,6 +245,22 @@ watch(period, () => {
 </template>
 
 <style scoped>
+.overview-with-period {
+  padding-top: 0;
+}
+
+.overview-period {
+  position: sticky;
+  z-index: 3;
+  top: 0;
+  display: flow-root;
+  padding-top: calc(8px + var(--analytics-top-inset));
+}
+
+.totals {
+  padding-top: 22px;
+}
+
 @property --difference-ring-angle {
   syntax: '<angle>';
   inherits: false;

@@ -1,0 +1,11 @@
+{
+  "name": "@financebro/bot",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@grammyjs/runner": "2.0.3",
+    "grammy": "1.46.0",
+    "multilingual-stemmer": "^2.2.1",
+    "zod": "4.6.7"
+  }
+}

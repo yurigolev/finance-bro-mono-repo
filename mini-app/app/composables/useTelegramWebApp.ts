@@ -6,9 +6,11 @@ interface TelegramWebApp {
   initData: string
   platform?: string
   colorScheme: 'light' | 'dark'
+  themeParams?: { header_bg_color?: string; bg_color?: string }
   ready?: () => void
   expand?: () => void
-  setBackgroundColor?: (color: 'bg_color') => void
+  setHeaderColor?: (color: string) => void
+  setBackgroundColor?: (color: string) => void
   onEvent?: (event: TelegramEvent, callback: () => void) => void
   offEvent?: (event: TelegramEvent, callback: () => void) => void
   isVersionAtLeast?: (version: string) => boolean
@@ -23,7 +25,8 @@ export function provideTelegramWebApp() {
     ? (window as Window & { Telegram?: { WebApp?: TelegramWebApp } }).Telegram?.WebApp
     : undefined
   const initData = telegram?.initData || undefined
-  const webApp = initData ? telegram : undefined
+  const isTelegram = initData || (telegram?.platform && telegram.platform !== 'unknown')
+  const webApp = isTelegram ? telegram : undefined
   const refreshers = new Set<Refresh>()
   provide(telegramSession, { initData, refreshers })
 
@@ -46,6 +49,14 @@ export function provideTelegramWebApp() {
   function handleThemeChange() {
     document.documentElement.dataset.theme =
       webApp?.colorScheme ?? (colorPreference?.matches ? 'dark' : 'light')
+    if (webApp?.isVersionAtLeast?.('6.1')) {
+      const { header_bg_color, bg_color } = webApp.themeParams ?? {}
+      if (webApp.platform === 'ios' || webApp.platform === 'android') {
+        const headerColor = header_bg_color ?? bg_color ?? 'bg_color'
+        webApp.setHeaderColor?.(webApp.isVersionAtLeast('6.9') ? headerColor : 'bg_color')
+      }
+      webApp.setBackgroundColor?.(header_bg_color ?? 'bg_color')
+    }
   }
 
   if (import.meta.client) {
@@ -64,7 +75,6 @@ export function provideTelegramWebApp() {
         // macOS may reveal the existing Mini App without firing an activation event.
         macRefreshTimer = window.setInterval(() => refresh(true), 10_000)
       }
-      if (webApp.isVersionAtLeast?.('6.1')) webApp.setBackgroundColor?.('bg_color')
       webApp.ready?.()
       webApp.expand?.()
     } else {
