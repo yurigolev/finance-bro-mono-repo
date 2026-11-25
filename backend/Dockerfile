@@ -10,9 +10,10 @@ RUN npm ci
 COPY tsconfig*.json ./
 COPY packages ./packages
 
-FROM build AS tools
-COPY services ./services
-COPY test ./test
+FROM manifests AS migrate
+RUN npm ci --workspace @financebro/core --include-workspace-root
+COPY services/core/drizzle.config.ts ./services/core/drizzle.config.ts
+COPY services/core/drizzle ./services/core/drizzle
 USER node
 
 FROM build AS core-build
