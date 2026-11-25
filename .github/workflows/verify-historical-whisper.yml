@@ -1,0 +1,36 @@
+name: Verify historical Whisper
+on:
+  push:
+    branches: [feature/verify-historical-whisper]
+permissions:
+  packages: read
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      IMAGE: ghcr.io/yurigolev/finance-bro-mono-repo/whisper@sha256:f300046a7c9a425dd206c80a9e8ef9da64c5cb80396ad4171bda5ed4c830c369
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Pull the historical image and verify the model
+        run: |
+          docker pull "$IMAGE"
+          mkdir -p "$RUNNER_TEMP/models"
+          curl -fsSL --retry 3 --max-time 300 -o "$RUNNER_TEMP/models/ggml-small.bin" \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+          printf '%s  %s\n' '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b' "$RUNNER_TEMP/models/ggml-small.bin" | sha256sum -c -
+      - name: Start Whisper and check HTTP readiness
+        run: |
+          docker run -d --name historical-whisper -p 127.0.0.1:8080:8080 \
+            -v "$RUNNER_TEMP/models:/models:ro" "$IMAGE" \
+            --host 0.0.0.0 --model /models/ggml-small.bin --language ru --threads 2 --no-gpu --convert --tmp-dir /tmp
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs historical-whisper
+          exit 1
