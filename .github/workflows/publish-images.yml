@@ -48,15 +48,27 @@ jobs:
         run: |
           api="repos/$GITHUB_REPOSITORY/actions"
           workflow=$(gh api "$api/runs/$GITHUB_RUN_ID" --jq '.workflow_id')
-          run=$(gh api --method GET "$api/workflows/$workflow/runs" \
+          previous=$(gh api --method GET "$api/workflows/$workflow/runs" \
             -f branch=develop -f event=push -f status=success -F per_page=1 \
-            --jq '.workflow_runs[0].id // empty')
+            --jq '.workflow_runs[0] // empty | [.id,.head_sha] | @tsv')
 
-          if [[ -n "$run" ]]; then
+          if [[ -n "$previous" ]]; then
+            read -r run commit <<< "$previous"
             artifact=$(gh api --method GET "$api/runs/$run/artifacts" -f name=image-set \
               --jq '.artifacts[] | select(.expired == false) | .id')
-            printf 'run=%s\nartifact=%s\n' "$run" "$artifact" >> "$GITHUB_OUTPUT"
+            printf 'run=%s\ncommit=%s\nartifact=%s\n' "$run" "$commit" "$artifact" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+        with:
+          version: 1.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download the last successful image set
         if: steps.previous.outputs.artifact != ''
@@ -66,6 +78,19 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ steps.previous.outputs.run }}
           path: ${{ runner.temp }}/previous-image-set
+
+      - name: Recover image set from GHCR
+        if: steps.previous.outputs.artifact == '' && steps.previous.outputs.commit != ''
+        shell: bash
+        env:
+          PREVIOUS_COMMIT: ${{ steps.previous.outputs.commit }}
+        run: |
+          log="$RUNNER_TEMP/previous-image-set.log"
+          if ! oras pull "$IMAGE_PREFIX/image-set:$PREVIOUS_COMMIT-${VPS_PLATFORM#linux/}" \
+            --output "$RUNNER_TEMP/previous-image-set" > "$log" 2>&1; then
+            cat "$log" >&2
+            grep -Fq 'not found' "$log"
+          fi
 
       - name: Select a comparison base
         id: baseline
@@ -87,7 +112,7 @@ jobs:
 
       - name: Detect image input changes
         id: changes
-        if: steps.baseline.outputs.commit != ''
+        if: steps.baseline.outputs.commit != '' && steps.baseline.outputs.commit != github.sha
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           base: ${{ steps.baseline.outputs.commit }}
@@ -160,14 +185,6 @@ jobs:
         if: steps.plan.outputs.targets != ''
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Log in to GHCR
-        if: steps.plan.outputs.targets != ''
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build and push selected images
         id: build
         if: steps.plan.outputs.targets != ''
@@ -208,6 +225,41 @@ jobs:
               | if ($images | keys) != $all then error("Incomplete image set") else . end
               | {commit: $commit, tree: $tree, compose: $compose, platform: $platform, images: $images}
             ' > "$RUNNER_TEMP/image-set.json"
+
+      - name: Preserve image sets in GHCR
+        shell: bash
+        env:
+          PREVIOUS_MANIFEST: ${{ steps.baseline.outputs.manifest }}
+          PREVIOUS_COMMIT: ${{ steps.baseline.outputs.commit }}
+        run: |
+          publish_image_set() {
+            local file=$1 commit=$2 reference digest
+            reference="$IMAGE_PREFIX/image-set:$commit-${VPS_PLATFORM#linux/}"
+            local existing="$RUNNER_TEMP/existing-image-set-$commit"
+            mkdir -p "$existing"
+            if oras pull "$reference" --output "$existing" > "$existing/pull.log" 2>&1; then
+              cmp "$file" "$existing/image-set.json"
+            elif grep -Fq 'not found' "$existing/pull.log"; then
+              (
+                cd "$(dirname "$file")"
+                oras push "$reference" \
+                  --artifact-type application/vnd.financebro.image-set.v1+json \
+                  --annotation "org.opencontainers.image.source=$IMAGE_SOURCE" \
+                  --annotation "org.opencontainers.image.revision=$commit" \
+                  image-set.json:application/json
+              )
+            else
+              cat "$existing/pull.log" >&2
+              return 1
+            fi
+            digest=$(oras resolve "$reference")
+            printf 'Image set: `%s/image-set@%s`\n\n' "$IMAGE_PREFIX" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if [[ -n "$PREVIOUS_COMMIT" && "$PREVIOUS_COMMIT" != "$GITHUB_SHA" ]]; then
+            publish_image_set "$PREVIOUS_MANIFEST" "$PREVIOUS_COMMIT"
+          fi
+          publish_image_set "$RUNNER_TEMP/image-set.json" "$GITHUB_SHA"
 
       - name: Upload the complete image set
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
