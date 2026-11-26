@@ -295,8 +295,12 @@ jobs:
           SSH_USER: ${{ vars.SSH_USER }}
           SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CORE_SERVICE_TOKEN: ${{ secrets.CORE_SERVICE_TOKEN }}
         run: |
-          set -eu
+          set -euo pipefail
           test "$SSH_HOST" = '135.106.172.166'
           test "$SSH_USER" = 'financebro-dev'
           test -n "$SSH_KNOWN_HOSTS"
@@ -310,10 +314,23 @@ jobs:
           umask 077
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$ssh_dir/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
-          ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
-            -o UserKnownHostsFile="$ssh_dir/known_hosts" -i "$ssh_dir/key" \
-            -l "$SSH_USER" -- "$SSH_HOST" < "$manifest"
+          python3 - "$manifest" <<'PY' | \
+            ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+              -o UserKnownHostsFile="$ssh_dir/known_hosts" -i "$ssh_dir/key" \
+              -l "$SSH_USER" -- "$SSH_HOST"
+          import json
+          import os
+          import sys
+
+          names = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN')
+          secrets = {name: os.environ.get(name) for name in names}
+          missing = [name for name, value in secrets.items() if not value]
+          if missing:
+              sys.exit('Missing dev environment secrets: ' + ', '.join(missing))
+          with open(sys.argv[1], encoding='utf-8') as artifact:
+              json.dump({'manifest': json.load(artifact), 'secrets': secrets}, sys.stdout)
+          PY
 
       - name: Verify public dev HTTPS
         shell: bash

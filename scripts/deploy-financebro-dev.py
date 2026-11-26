@@ -18,6 +18,8 @@ IMAGES = {'migrate': 'MIGRATE_IMAGE', 'core': 'CORE_IMAGE', 'mini-app': 'MINI_AP
 RUNNING = {'core': 'financebro-dev-financial-core', 'mini-app': 'financebro-dev-mini-app'}
 GIT_HASH = re.compile(r'[a-f0-9]{40}')
 DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
+SECRET_NAMES = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN')
+MAX_REQUEST_BYTES = 16 * 1024
 
 
 def image_refs(manifest):
@@ -31,12 +33,12 @@ def image_refs(manifest):
     return refs
 
 
-def compose(image_env, *args):
+def compose(image_env, settings, *args):
     command = [
         'docker', 'compose', '--project-name', 'financebro-dev', '--project-directory', str(ROOT),
-        '--env-file', str(ROOT / 'deploy.env'), '--env-file', str(image_env), '-f', str(ROOT / 'compose.yaml'),
+        '--env-file', str(image_env), '-f', str(ROOT / 'compose.yaml'),
     ]
-    subprocess.run([*command, *args], check=True, timeout=300)
+    subprocess.run([*command, *args], check=True, timeout=300, env=os.environ | settings)
 
 
 def inspect(container, template):
@@ -63,10 +65,20 @@ def wait_for_mini_app():
 
 
 def main():
-    raw = sys.stdin.buffer.read(16 * 1024 + 1)
-    if len(raw) > 16 * 1024:
-        raise ValueError('Manifest exceeds 16 KiB')
-    manifest = json.loads(raw)
+    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise ValueError('Deployment request exceeds 16 KiB')
+    request = json.loads(raw)
+    manifest = request['manifest']
+    secrets = request['secrets']
+    if not isinstance(secrets, dict):
+        raise ValueError('Deployment secrets must be a JSON object')
+    settings = {'COMPOSE_PROJECT_NAME': 'financebro-dev'}
+    for name in SECRET_NAMES:
+        value = secrets.get(name)
+        if not isinstance(value, str) or not value or any(char in value for char in '\r\n\0'):
+            raise ValueError(f'Missing or invalid deployment secret: {name}')
+        settings[name] = value
     if not all(GIT_HASH.fullmatch(manifest[key]) for key in ('commit', 'tree', 'compose')):
         raise ValueError('Invalid Git hashes in image manifest')
     if manifest['platform'] != 'linux/amd64':
@@ -84,6 +96,7 @@ def main():
         stage = Path(temporary) / 'images.env'
         stage.write_text(''.join(f'{IMAGES[key]}={value}\n' for key, value in refs.items()) +
                          f'FINANCEBRO_DEPLOYED_SHA={manifest["commit"]}\n')
+        compose(stage, settings, 'config', '--quiet')
         if inspect('financebro-dev-postgres', '{{.State.Health.Status}}') != 'healthy':
             raise ValueError('The existing dev PostgreSQL is not healthy')
         targets = [name for name, container in RUNNING.items()
@@ -92,20 +105,20 @@ def main():
         print(f'Updating: {", ".join(targets) or "none"}; migrations: {"yes" if migrate else "no"}', flush=True)
         pull = (['migrate'] if migrate else []) + targets
         if pull:
-            compose(stage, 'pull', *pull)
+            compose(stage, settings, 'pull', *pull)
         if migrate:
-            compose(stage, 'run', '--rm', '--no-deps', '--pull', 'never', 'migrate')
+            compose(stage, settings, 'run', '--rm', '--no-deps', '--pull', 'never', 'migrate')
         attempted = False
         try:
             if targets:
                 attempted = True
-                compose(stage, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait',
+                compose(stage, settings, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait',
                         '--wait-timeout', '90', *targets)
             wait_for_mini_app()
             os.replace(stage, current)
         except (ValueError, OSError, subprocess.SubprocessError):
             if attempted:
-                compose(current, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait',
+                compose(current, settings, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait',
                         '--wait-timeout', '90', *targets)
             raise
     print(f'Deployed FinanceBro dev {manifest["commit"]}', flush=True)
