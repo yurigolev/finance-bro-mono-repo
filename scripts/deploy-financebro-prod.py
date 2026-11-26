@@ -2,7 +2,6 @@
 
 import fcntl
 import hashlib
-import ipaddress
 import json
 import os
 import re
@@ -44,6 +43,18 @@ def compose(settings, *args, capture_output=False):
     )
 
 
+def check_relay(settings):
+    compose(
+        settings, 'exec', '-T', 'telegram-relay', 'node', '-e',
+        "require('node:https').get({hostname:'api.telegram.org',timeout:8000,"
+        "lookup:(_host,opts,callback) => callback(null,opts.all ? "
+        "[{address:'127.0.0.1',family:4}] : '127.0.0.1',4)},response => "
+        "process.exit(response.statusCode === 302 ? 0 : 1))"
+        ".on('timeout', () => process.exit(1)).on('error', () => process.exit(1))",
+    )
+    print('Telegram HTTPS checked through the WireGuard relay', flush=True)
+
+
 def check_services(settings):
     compose(
         settings, 'exec', '-T', 'mini-app', 'wget', '-qO', '/dev/null', 'http://127.0.0.1/',
@@ -74,10 +85,6 @@ def main():
         if not isinstance(value, str) or not value or any(char in value for char in '\r\n\0'):
             raise ValueError(f'Missing or invalid production secret: {name}')
         settings[name] = value
-    address = ipaddress.IPv4Address(request['telegram_api_ipv4'])
-    if not address.is_global:
-        raise ValueError('Expected a public Telegram API IPv4 address')
-    settings['TELEGRAM_API_IPV4'] = str(address)
     settings['DB_IMAGE'] = 'postgres@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71'
     password = quote(settings['POSTGRES_PASSWORD'], safe='')
     settings['DATABASE_URL'] = f'postgresql://financebro:{password}@db:5432/financebro'
@@ -87,17 +94,28 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         if hashlib.sha256(CONFIG.read_bytes()).hexdigest() != request['deploy_compose_sha256']:
             raise ValueError('Review and install the tagged production Compose file first')
+        if hashlib.sha256((ROOT / 'telegram-relay.mjs').read_bytes()).hexdigest() != request['telegram_relay_sha256']:
+            raise ValueError('Install the tagged Telegram relay before deployment')
         previous = json.loads(STATE.read_text())['manifest'] if STATE.exists() else None
         services = [
             service for service in SERVICES
             if previous is None or previous['images'][service] != manifest['images'][service]
         ]
+        if 'bot' not in services:
+            old_bot = subprocess.run(
+                ['docker', 'inspect', '--type=container', '--format', '{{json .HostConfig.ExtraHosts}}',
+                 'financebro-prod-bot-1'], capture_output=True, text=True, check=False, timeout=15,
+            )
+            if old_bot.returncode != 0 or json.loads(old_bot.stdout):
+                services.append('bot')
         migrate = previous is None or previous['images']['migrate'] != manifest['images']['migrate']
         print(f'Updating: {", ".join(services) or "none"}; migrations: {"yes" if migrate else "no"}', flush=True)
         compose(candidate, 'config', '--quiet')
         if services or migrate:
             compose(candidate, 'pull', 'db', *(['migrate'] if migrate else []), *services)
             compose(candidate, 'up', '-d', '--wait', '--wait-timeout', '90', 'db')
+        compose(candidate, 'up', '-d', '--no-deps', '--pull', 'never', 'telegram-relay')
+        check_relay(candidate)
         if migrate:
             compose(candidate, 'run', '--rm', '--no-deps', '--pull', 'never', 'migrate')
         try:
