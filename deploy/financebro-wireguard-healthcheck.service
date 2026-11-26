@@ -1,0 +1,9 @@
+[Unit]
+Description=Check production Telegram access through the FinanceBro WireGuard relay
+After=docker.service
+
+[Service]
+Type=oneshot
+LoadCredentialEncrypted=ping-url:/etc/credstore.encrypted/financebro-wireguard-healthcheck
+ExecStart=/usr/local/sbin/monitor-financebro-wireguard
+TimeoutStartSec=25s
