@@ -121,14 +121,20 @@ def main():
                 raise ValueError(f'Install the required dev file: {path.name}')
         previous = dict(line.split('=', 1) for line in current.read_text().splitlines())
         stage = Path(temporary) / 'images.env'
+        overlay_sha = request['bot_compose_sha256']
         stage.write_text(''.join(f'{IMAGES[key]}={value}\n' for key, value in refs.items()) +
-                         f'FINANCEBRO_DEPLOYED_SHA={manifest["commit"]}\n')
+                         f'FINANCEBRO_DEPLOYED_SHA={manifest["commit"]}\n'
+                         f'FINANCEBRO_BOT_COMPOSE_SHA256={overlay_sha}\n')
         compose(stage, settings, 'config', '--quiet')
         if inspect('financebro-dev-postgres', '{{.State.Health.Status}}') != 'healthy':
             raise ValueError('The existing dev PostgreSQL is not healthy')
         running = {name: inspect(container, '{{.Config.Image}} {{.State.Running}}')
                    for name, container in RUNNING.items()}
-        targets = [name for name, state in running.items() if state != f'{refs[name]} true']
+        changed_overlay = previous.get('FINANCEBRO_BOT_COMPOSE_SHA256') != overlay_sha
+        targets = [
+            name for name, state in running.items()
+            if state != f'{refs[name]} true' or (changed_overlay and name in ('whisper', 'input', 'bot'))
+        ]
         migrate = previous['MIGRATE_IMAGE'] != refs['migrate']
         print(f'Updating: {", ".join(targets) or "none"}; migrations: {"yes" if migrate else "no"}', flush=True)
         pull = (['migrate'] if migrate else []) + targets
