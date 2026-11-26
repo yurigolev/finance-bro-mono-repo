@@ -269,3 +269,56 @@ jobs:
           path: ${{ runner.temp }}/image-set.json
           if-no-files-found: error
           overwrite: true
+
+  deploy-dev:
+    name: Deploy FinanceBro dev
+    needs: publish
+    environment: dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-set
+          path: ${{ runner.temp }}/financebro-image-set
+
+      - name: Apply image set over restricted SSH
+        shell: bash
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -eu
+          test "$SSH_HOST" = '135.106.172.166'
+          test "$SSH_USER" = 'financebro-dev'
+          test -n "$SSH_KNOWN_HOSTS"
+          test -n "$SSH_PRIVATE_KEY"
+          manifest="$RUNNER_TEMP/financebro-image-set/image-set.json"
+          jq -e --arg commit "$GITHUB_SHA" --arg tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg compose "$(git rev-parse HEAD:compose.yaml)" \
+            '.commit == $commit and .tree == $tree and .compose == $compose' "$manifest" >/dev/null
+          ssh_dir=$(mktemp -d)
+          trap 'rm -f "$ssh_dir/key" "$ssh_dir/known_hosts"; rmdir "$ssh_dir"' EXIT
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="$ssh_dir/known_hosts" -i "$ssh_dir/key" \
+            -l "$SSH_USER" -- "$SSH_HOST" < "$manifest"
+
+      - name: Verify public dev HTTPS
+        shell: bash
+        run: |
+          url='https://135.106.172.166:8443'
+          test "$(curl -fsS --max-time 15 -o /dev/null -w '%{http_code}' "$url/")" = 200
+          test "$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' \
+            "$url/api/analytics/overview?period=current-month")" = 401
