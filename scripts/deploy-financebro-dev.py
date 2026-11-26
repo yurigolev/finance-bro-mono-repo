@@ -1,6 +1,7 @@
 """Apply a published image set to the preinstalled FinanceBro dev stack."""
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -14,11 +15,19 @@ from urllib.request import urlopen
 
 ROOT = Path('/srv/financebro-dev')
 REGISTRY = 'ghcr.io/yurigolev/finance-bro-mono-repo'
-IMAGES = {'migrate': 'MIGRATE_IMAGE', 'core': 'CORE_IMAGE', 'mini-app': 'MINI_APP_IMAGE'}
-RUNNING = {'core': 'financebro-dev-financial-core', 'mini-app': 'financebro-dev-mini-app'}
+IMAGES = {
+    'migrate': 'MIGRATE_IMAGE', 'core': 'CORE_IMAGE', 'mini-app': 'MINI_APP_IMAGE',
+    'whisper': 'WHISPER_IMAGE', 'input': 'INPUT_IMAGE', 'bot': 'BOT_IMAGE',
+}
+RUNNING = {
+    'core': 'financebro-dev-financial-core', 'mini-app': 'financebro-dev-mini-app',
+    'whisper': 'financebro-dev-whisper', 'input': 'financebro-dev-input',
+    'bot': 'financebro-dev-bot',
+}
+BOT_COMPOSE = ROOT / 'bot.compose.yaml'
 GIT_HASH = re.compile(r'[a-f0-9]{40}')
 DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
-SECRET_NAMES = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN')
+SECRET_NAMES = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN', 'INPUT_SERVICE_TOKEN')
 MAX_REQUEST_BYTES = 16 * 1024
 
 
@@ -37,6 +46,7 @@ def compose(image_env, settings, *args):
     command = [
         'docker', 'compose', '--project-name', 'financebro-dev', '--project-directory', str(ROOT),
         '--env-file', str(image_env), '-f', str(ROOT / 'compose.yaml'),
+        '-f', str(BOT_COMPOSE),
     ]
     subprocess.run([*command, *args], check=True, timeout=300, env=os.environ | settings)
 
@@ -62,6 +72,17 @@ def wait_for_mini_app():
             return
         time.sleep(2)
     raise ValueError('FinanceBro dev did not pass the Mini App and API health checks')
+
+
+def check_telegram(image_env, settings):
+    compose(
+        image_env, settings, 'exec', '-T', 'bot', 'node', '-e',
+        "fetch('https://api.telegram.org/bot' + process.env.BOT_TOKEN + '/getMe', "
+        "{signal:AbortSignal.timeout(8000)}).then(r=>r.json()).then(body=>"
+        "process.exit(body.ok && body.result.username.toLowerCase()==='financebrotestbot'?0:1))"
+        ".catch(()=>process.exit(1))",
+    )
+    print('Dev Telegram getMe passed', flush=True)
 
 
 def main():
@@ -92,15 +113,28 @@ def main():
 
     with (ROOT / '.deploy.lock').open('a') as lock, tempfile.TemporaryDirectory(dir=ROOT) as temporary:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        for key, path in (
+            ('bot_compose_sha256', BOT_COMPOSE),
+            ('telegram_relay_sha256', ROOT / 'telegram-relay.mjs'),
+        ):
+            if hashlib.sha256(path.read_bytes()).hexdigest() != request[key]:
+                raise ValueError(f'Install the required dev file: {path.name}')
         previous = dict(line.split('=', 1) for line in current.read_text().splitlines())
         stage = Path(temporary) / 'images.env'
+        overlay_sha = request['bot_compose_sha256']
         stage.write_text(''.join(f'{IMAGES[key]}={value}\n' for key, value in refs.items()) +
-                         f'FINANCEBRO_DEPLOYED_SHA={manifest["commit"]}\n')
+                         f'FINANCEBRO_DEPLOYED_SHA={manifest["commit"]}\n'
+                         f'FINANCEBRO_BOT_COMPOSE_SHA256={overlay_sha}\n')
         compose(stage, settings, 'config', '--quiet')
         if inspect('financebro-dev-postgres', '{{.State.Health.Status}}') != 'healthy':
             raise ValueError('The existing dev PostgreSQL is not healthy')
-        targets = [name for name, container in RUNNING.items()
-                   if inspect(container, '{{.Config.Image}} {{.State.Running}}') != f'{refs[name]} true']
+        running = {name: inspect(container, '{{.Config.Image}} {{.State.Running}}')
+                   for name, container in RUNNING.items()}
+        changed_overlay = previous.get('FINANCEBRO_BOT_COMPOSE_SHA256') != overlay_sha
+        targets = [
+            name for name, state in running.items()
+            if state != f'{refs[name]} true' or (changed_overlay and name in ('whisper', 'input', 'bot'))
+        ]
         migrate = previous['MIGRATE_IMAGE'] != refs['migrate']
         print(f'Updating: {", ".join(targets) or "none"}; migrations: {"yes" if migrate else "no"}', flush=True)
         pull = (['migrate'] if migrate else []) + targets
@@ -108,18 +142,27 @@ def main():
             compose(stage, settings, 'pull', *pull)
         if migrate:
             compose(stage, settings, 'run', '--rm', '--no-deps', '--pull', 'never', 'migrate')
-        attempted = False
+        up = ('up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '90')
+        existing_targets = [name for name in targets if (running[name] or '').endswith(' true')]
+        new_targets = [name for name in targets if name not in existing_targets]
+        compose(stage, settings, *up, 'telegram-relay')
         try:
-            if targets:
-                attempted = True
-                compose(stage, settings, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait',
-                        '--wait-timeout', '90', *targets)
+            dependencies = [name for name in targets if name != 'bot']
+            if dependencies:
+                compose(stage, settings, *up, *dependencies)
+            if 'bot' in targets:
+                compose(stage, settings, *up, 'bot')
             wait_for_mini_app()
+            check_telegram(stage, settings)
             os.replace(stage, current)
         except (ValueError, OSError, subprocess.SubprocessError):
-            if attempted:
-                compose(current, settings, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', '--wait',
-                        '--wait-timeout', '90', *targets)
+            if new_targets:
+                compose(stage, settings, 'stop', *new_targets)
+            if existing_targets:
+                rollback = Path(temporary) / 'previous-images.env'
+                rollback.write_text(''.join(f'{key}={value}\n' for key, value in
+                                            ({IMAGES[name]: ref for name, ref in refs.items()} | previous).items()))
+                compose(rollback, settings, *up, *existing_targets)
             raise
     print(f'Deployed FinanceBro dev {manifest["commit"]}', flush=True)
 

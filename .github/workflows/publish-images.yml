@@ -299,6 +299,7 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           CORE_SERVICE_TOKEN: ${{ secrets.CORE_SERVICE_TOKEN }}
+          INPUT_SERVICE_TOKEN: ${{ secrets.INPUT_SERVICE_TOKEN }}
         run: |
           set -euo pipefail
           test "$SSH_HOST" = '135.106.172.166'
@@ -319,17 +320,24 @@ jobs:
               -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
               -o UserKnownHostsFile="$ssh_dir/known_hosts" -i "$ssh_dir/key" \
               -l "$SSH_USER" -- "$SSH_HOST"
+          import hashlib
           import json
           import os
           import sys
+          from pathlib import Path
 
-          names = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN')
+          names = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN', 'INPUT_SERVICE_TOKEN')
           secrets = {name: os.environ.get(name) for name in names}
           missing = [name for name, value in secrets.items() if not value]
           if missing:
               sys.exit('Missing dev environment secrets: ' + ', '.join(missing))
           with open(sys.argv[1], encoding='utf-8') as artifact:
-              json.dump({'manifest': json.load(artifact), 'secrets': secrets}, sys.stdout)
+              json.dump({
+                  'manifest': json.load(artifact),
+                  'secrets': secrets,
+                  'bot_compose_sha256': hashlib.sha256(Path('deploy/financebro-dev-bot.compose.yaml').read_bytes()).hexdigest(),
+                  'telegram_relay_sha256': hashlib.sha256(Path('deploy/telegram-relay.mjs').read_bytes()).hexdigest(),
+              }, sys.stdout)
           PY
 
       - name: Verify public dev HTTPS
