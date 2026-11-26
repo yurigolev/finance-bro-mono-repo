@@ -1,0 +1,14 @@
+[Unit]
+Description=FinanceBro dev Telegram relay through the Asker WireGuard namespace
+Requires=asker-vpn.service
+After=asker-vpn.service
+PartOf=asker-vpn.service
+
+[Service]
+ExecStart=/usr/bin/docker run --rm --name financebro-dev-telegram-vpn --network container:asker-vpn --pull never --read-only --cap-drop ALL --security-opt no-new-privileges --user 19797:19797 --mount type=bind,src=/srv/financebro-dev/telegram-relay.mjs,dst=/telegram-relay.mjs,readonly --mount type=bind,src=/srv/financebro-dev/telegram-socket,dst=/telegram-socket node@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 node /telegram-relay.mjs wireguard
+ExecStop=-/usr/bin/docker stop --time 5 financebro-dev-telegram-vpn
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=asker-vpn.service
