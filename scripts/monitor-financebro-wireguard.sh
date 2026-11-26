@@ -12,4 +12,8 @@ if ! printf '%s\n' "$url" | grep -Eq '^https://hc-ping\.com/[a-f0-9-]{36}$'; the
     printf '%s\n' 'Missing or invalid WireGuard Healthchecks URL' >&2
     exit 1
 fi
-printf 'url = "%s"\n' "$url" | /usr/bin/curl --config - --request POST --max-time 8 --fail --silent --output /dev/null
+receipt=$(printf 'url = "%s"\n' "$url" | /usr/bin/docker exec -i asker-vpn curl --config - --request POST --max-time 8 --fail --silent)
+if [ "$receipt" != OK ]; then
+    printf '%s\n' 'Healthchecks rejected the WireGuard receipt' >&2
+    exit 1
+fi

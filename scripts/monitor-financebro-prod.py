@@ -44,7 +44,7 @@ def inspect_production():
 def publish(url, healthy):
     transfer = Request(url if healthy else f'{url}/fail', data=b'', method='POST')
     with urlopen(transfer, timeout=8) as response:
-        if response.status != 200:
+        if response.status != 200 or response.read().strip() != b'OK':
             raise ValueError('Unexpected Healthchecks response')
 
 
