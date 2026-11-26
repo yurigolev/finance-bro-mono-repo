@@ -177,7 +177,7 @@ function showSavedOperation(date: string, kind: OperationKind) {
 <template>
   <main class="analytics history" aria-labelledby="history-title">
     <header class="history-header">
-      <h1 id="history-title">История</h1>
+      <h1 id="history-title">История операций</h1>
       <HistoryEntryDialog
         v-if="initData && history && !expired"
         :init-data="initData"
