@@ -73,7 +73,6 @@ jobs:
           SSH_USER: ${{ vars.SSH_USER }}
           SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          TELEGRAM_API_IPV4: ${{ vars.TELEGRAM_API_IPV4 }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           CORE_SERVICE_TOKEN: ${{ secrets.CORE_SERVICE_TOKEN }}
@@ -109,7 +108,7 @@ jobs:
               'commit': os.environ['GITHUB_SHA'],
               'manifest': json.loads(Path(sys.argv[1]).read_text()),
               'deploy_compose_sha256': hashlib.sha256(Path('deploy/financebro-prod.compose.yaml').read_bytes()).hexdigest(),
-              'telegram_api_ipv4': os.environ['TELEGRAM_API_IPV4'],
+              'telegram_relay_sha256': hashlib.sha256(Path('deploy/telegram-relay.mjs').read_bytes()).hexdigest(),
               'secrets': secrets,
           }, sys.stdout)
           PY

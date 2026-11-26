@@ -56,11 +56,26 @@ services:
       CORE_SERVICE_TOKEN: ${CORE_SERVICE_TOKEN:?}
       INPUT_URL: http://input:8788
       INPUT_SERVICE_TOKEN: ${INPUT_SERVICE_TOKEN:?}
-    extra_hosts:
-      - 'api.telegram.org:${TELEGRAM_API_IPV4:?}'
     networks: [frontend, bot-egress, input-api]
     stop_grace_period: 90s
     init: true
+    restart: unless-stopped
+  telegram-relay:
+    image: ${BOT_IMAGE:?}
+    user: '19797:19797'
+    entrypoint: [node, /telegram-relay.mjs]
+    command: [bridge]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: '443'
+    volumes:
+      - ./telegram-relay.mjs:/telegram-relay.mjs:ro
+      - ./telegram-socket:/telegram-socket:ro
+    networks:
+      bot-egress:
+        aliases: [api.telegram.org]
     restart: unless-stopped
   input:
     image: ${INPUT_IMAGE:?}
