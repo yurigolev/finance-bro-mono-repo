@@ -7,13 +7,9 @@ fetch("https://api.telegram.org/", {redirect:"manual",signal:AbortSignal.timeout
   .catch(() => process.exit(1));
 '
 
-url=$(cat "$CREDENTIALS_DIRECTORY/ping-url")
-if ! printf '%s\n' "$url" | grep -Eq '^https://hc-ping\.com/[a-f0-9-]{36}$'; then
-    printf '%s\n' 'Missing or invalid WireGuard Healthchecks URL' >&2
+key=$(cat "$CREDENTIALS_DIRECTORY/telemetry-key")
+if ! printf '%s\n' "$key" | grep -Eq '^[A-Za-z0-9_-]{16,80}$'; then
+    printf '%s\n' 'Missing or invalid Cronitor telemetry key' >&2
     exit 1
 fi
-receipt=$(printf 'url = "%s"\n' "$url" | /usr/bin/docker exec -i asker-vpn curl --config - --request POST --max-time 8 --fail --silent)
-if [ "$receipt" != OK ]; then
-    printf '%s\n' 'Healthchecks rejected the WireGuard receipt' >&2
-    exit 1
-fi
+printf 'url = "https://cronitor.link/p/%s/financebro-prod-wireguard"\n' "$key" | /usr/bin/curl --config - --max-time 8 --fail --silent --output /dev/null

@@ -23,7 +23,5 @@ jobs:
           persist-credentials: false
       - name: Check live production HTTPS and certificate lifetime
         env:
-          HEALTHCHECKS_PROD_HTTPS_URL: ${{ secrets.HEALTHCHECKS_PROD_HTTPS_URL }}
-          HEALTHCHECKS_PROD_TLS_WARNING_URL: ${{ secrets.HEALTHCHECKS_PROD_TLS_WARNING_URL }}
-          HEALTHCHECKS_PROD_TLS_CRITICAL_URL: ${{ secrets.HEALTHCHECKS_PROD_TLS_CRITICAL_URL }}
+          CRONITOR_TELEMETRY_KEY: ${{ secrets.CRONITOR_TELEMETRY_KEY }}
         run: python3 scripts/monitor-financebro-prod.py

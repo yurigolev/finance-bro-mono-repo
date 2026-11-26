@@ -1,4 +1,4 @@
-"""Check FinanceBro's public endpoints and report results to Healthchecks.io."""
+"""Check FinanceBro's public endpoints and report results to Cronitor."""
 
 import http.client
 import os
@@ -6,14 +6,14 @@ import re
 import ssl
 import time
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
 PROD_IP = '135.106.172.166'
-PING_URL = re.compile(r'https://hc-ping\.com/[a-f0-9-]{36}')
+TELEMETRY_KEY = re.compile(r'[A-Za-z0-9_-]{16,80}')
 CHECKS = {
-    'https': 'HEALTHCHECKS_PROD_HTTPS_URL',
-    'tls-warning': 'HEALTHCHECKS_PROD_TLS_WARNING_URL',
-    'tls-critical': 'HEALTHCHECKS_PROD_TLS_CRITICAL_URL',
+    'https': 'financebro-prod-https',
+    'tls-warning': 'financebro-prod-tls-48h',
+    'tls-critical': 'financebro-prod-tls-24h',
 }
 
 
@@ -41,17 +41,17 @@ def inspect_production():
         connection.close()
 
 
-def publish(url, healthy):
-    transfer = Request(url if healthy else f'{url}/fail', data=b'', method='POST')
-    with urlopen(transfer, timeout=8) as response:
-        if response.status != 200 or response.read().strip() != b'OK':
-            raise ValueError('Unexpected Healthchecks response')
+def publish(key, check, healthy):
+    url = f'https://cronitor.link/p/{key}/{check}'
+    with urlopen(url if healthy else f'{url}?state=fail', timeout=8) as response:
+        if response.status != 200:
+            raise ValueError('Unexpected Cronitor response')
 
 
 def main():
-    urls = {label: os.environ.get(secret, '') for label, secret in CHECKS.items()}
-    if any(not PING_URL.fullmatch(url) for url in urls.values()):
-        raise SystemExit('Missing or invalid production Healthchecks URLs')
+    key = os.environ.get('CRONITOR_TELEMETRY_KEY', '')
+    if not TELEMETRY_KEY.fullmatch(key):
+        raise SystemExit('Missing or invalid Cronitor telemetry key')
     http_ok, expiry = inspect_production()
     outcomes = {'https': http_ok}
     if expiry is not None:
@@ -61,7 +61,7 @@ def main():
     errors = []
     for label, healthy in outcomes.items():
         try:
-            publish(urls[label], healthy)
+            publish(key, CHECKS[label], healthy)
             print(f'{label}: {"healthy" if healthy else "failed"}')
         except (OSError, URLError, ValueError):
             errors.append(label)
