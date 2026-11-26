@@ -1,0 +1,115 @@
+name: Deploy FinanceBro production
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: financebro-prod
+  queue: max
+
+jobs:
+  deploy:
+    environment: prod
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release and fetch the successful dev image set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          release=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          git merge-base --is-ancestor "$release" origin/main
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$release/pulls" --jq \
+            ".[] | select(.base.ref == \"main\" and .head.ref == \"develop\" and .merged_at != null and .merge_commit_sha == \"$release\") | [.number, .head.sha] | @tsv")
+          test -n "$pr"
+          read -r number develop_sha <<< "$pr"
+
+          ci_runs=$(gh api --paginate --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f event=pull_request -f status=success -f head_sha="$develop_sha" --jq '.workflow_runs[].id')
+          verified=false
+          for run in $ci_runs; do
+            evidence="$RUNNER_TEMP/ci-$run"
+            if gh run download "$run" --name tested-tree --dir "$evidence" &&
+              jq -e --argjson pr "$number" --arg head "$develop_sha" --arg tree "$tree" \
+                '.pr == $pr and .head == $head and .tree == $tree' "$evidence/tested-tree.json" >/dev/null; then
+              verified=true
+              break
+            fi
+          done
+          if [[ "$verified" != true ]]; then
+            echo 'No successful main PR CI run verified the exact release tree.' >&2
+            exit 1
+          fi
+
+          dev_run=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/publish-images.yml/runs" \
+            -f branch=develop -f event=push -f status=success -f head_sha="$develop_sha" --jq '.workflow_runs[0].id // empty')
+          test -n "$dev_run"
+          gh run download "$dev_run" --name image-set --dir "$RUNNER_TEMP/financebro-image-set"
+          jq -e --arg commit "$develop_sha" --arg tree "$tree" --arg compose "$(git rev-parse HEAD:compose.yaml)" \
+            '.commit == $commit and .tree == $tree and .compose == $compose and .platform == "linux/amd64"' \
+            "$RUNNER_TEMP/financebro-image-set/image-set.json" >/dev/null
+          printf 'Verified PR #%s with CI run %s and dev deployment %s\n' "$number" "$run" "$dev_run"
+
+      - name: Deploy with GitHub Environment secrets over restricted SSH
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          TELEGRAM_API_IPV4: ${{ vars.TELEGRAM_API_IPV4 }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          CORE_SERVICE_TOKEN: ${{ secrets.CORE_SERVICE_TOKEN }}
+          INPUT_SERVICE_TOKEN: ${{ secrets.INPUT_SERVICE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$SSH_HOST" = 135.106.172.166
+          test "$SSH_USER" = financebro-prod
+          test -n "$SSH_KNOWN_HOSTS"
+          test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -f "$ssh_dir/key" "$ssh_dir/known_hosts"; rmdir "$ssh_dir"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          python3 - "$RUNNER_TEMP/financebro-image-set/image-set.json" <<'PY' | \
+            ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+              -o UserKnownHostsFile="$ssh_dir/known_hosts" -i "$ssh_dir/key" \
+              -l "$SSH_USER" -- "$SSH_HOST"
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          names = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'CORE_SERVICE_TOKEN', 'INPUT_SERVICE_TOKEN')
+          secrets = {name: os.environ.get(name) for name in names}
+          missing = [name for name, value in secrets.items() if not value]
+          if missing:
+              sys.exit('Missing prod environment secrets: ' + ', '.join(missing))
+          json.dump({
+              'commit': os.environ['GITHUB_SHA'],
+              'manifest': json.loads(Path(sys.argv[1]).read_text()),
+              'deploy_compose_sha256': hashlib.sha256(Path('deploy/financebro-prod.compose.yaml').read_bytes()).hexdigest(),
+              'telegram_api_ipv4': os.environ['TELEGRAM_API_IPV4'],
+              'secrets': secrets,
+          }, sys.stdout)
+          PY

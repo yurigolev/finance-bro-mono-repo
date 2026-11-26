@@ -1,0 +1,143 @@
+name: financebro-prod
+services:
+  db:
+    image: ${DB_IMAGE:?}
+    environment:
+      POSTGRES_USER: financebro
+      POSTGRES_DB: financebro
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes: [postgres-data:/var/lib/postgresql]
+    networks: [database]
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, financebro, -d, financebro]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  migrate:
+    image: ${MIGRATE_IMAGE:?}
+    command: [npm, run, db:migrate]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?}
+    networks: [database]
+    depends_on:
+      db:
+        condition: service_healthy
+  core:
+    image: ${CORE_IMAGE:?}
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?}
+      DATABASE_URL: ${DATABASE_URL:?}
+      CORE_SERVICE_TOKEN: ${CORE_SERVICE_TOKEN:?}
+      ANALYTICS_HTTP_HOST: 0.0.0.0
+      ANALYTICS_HTTP_PORT: '8787'
+    networks: [database, frontend]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:8787/api/analytics/overview', {signal: AbortSignal.timeout(1500)}).then(r => process.exit(r.status === 401 ? 0 : 1), () => process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    init: true
+    restart: unless-stopped
+  bot:
+    image: ${BOT_IMAGE:?}
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?}
+      CORE_URL: http://core:8787
+      CORE_SERVICE_TOKEN: ${CORE_SERVICE_TOKEN:?}
+      INPUT_URL: http://input:8788
+      INPUT_SERVICE_TOKEN: ${INPUT_SERVICE_TOKEN:?}
+    extra_hosts:
+      - 'api.telegram.org:${TELEGRAM_API_IPV4:?}'
+    networks: [frontend, bot-egress, input-api]
+    stop_grace_period: 90s
+    init: true
+    restart: unless-stopped
+  input:
+    image: ${INPUT_IMAGE:?}
+    environment:
+      INPUT_SERVICE_TOKEN: ${INPUT_SERVICE_TOKEN:?}
+      INPUT_HTTP_HOST: 0.0.0.0
+      INPUT_HTTP_PORT: '8788'
+      WHISPER_URL: http://whisper:8080/inference
+    networks: [input-api, speech]
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:8788/health', {signal: AbortSignal.timeout(1500)}).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    tmpfs: [/tmp]
+    init: true
+    restart: unless-stopped
+  whisper:
+    image: ${WHISPER_IMAGE:?}
+    command:
+      [
+        '--host',
+        '0.0.0.0',
+        '--model',
+        '/models/ggml-small.bin',
+        '--language',
+        'ru',
+        '--threads',
+        '1',
+        '--no-gpu',
+        '--convert',
+        '--tmp-dir',
+        '/tmp',
+      ]
+    networks: [speech]
+    volumes: [./models:/models:ro]
+    tmpfs: [/tmp]
+    healthcheck:
+      test: [CMD, curl, -fsS, 'http://localhost:8080/health']
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    restart: unless-stopped
+  mini-app:
+    image: ${MINI_APP_IMAGE:?}
+    environment:
+      ANALYTICS_LISTEN: '80'
+      ANALYTICS_API_UPSTREAM: core:8787
+      ANALYTICS_STATIC_ROOT: /usr/share/nginx/html
+      ANALYTICS_DNS_DIRECTIVE: resolver 127.0.0.11 valid=10s ipv6=off;
+      NGINX_ENVSUBST_FILTER: ^ANALYTICS_
+    depends_on:
+      core:
+        condition: service_healthy
+    networks:
+      frontend: {}
+      ingress:
+        aliases: [financebro-prod-mini-app]
+    restart: unless-stopped
+networks:
+  database:
+    internal: true
+  frontend: {}
+  input-api:
+    internal: true
+  speech:
+    internal: true
+  bot-egress:
+  ingress:
+    name: financebro-prod-ingress
+    external: true
+volumes:
+  postgres-data:

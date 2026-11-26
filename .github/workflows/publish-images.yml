@@ -1,0 +1,341 @@
+name: Publish images
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-images
+  queue: max
+
+jobs:
+  publish:
+    name: Publish changed images to GHCR
+    runs-on: ${{ vars.VPS_PLATFORM == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      VPS_PLATFORM: ${{ vars.VPS_PLATFORM }}
+      ALL_SERVICES: bot,core,input,migrate,mini-app,whisper
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set image platform and repository
+        shell: bash
+        run: |
+          case "$VPS_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo 'Set VPS_PLATFORM to linux/amd64 or linux/arm64.' >&2; exit 1 ;;
+          esac
+          {
+            printf 'IMAGE_PREFIX=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}"
+            printf 'IMAGE_TAG=%s-%s\n' "$GITHUB_SHA" "${VPS_PLATFORM#linux/}"
+            printf 'IMAGE_SOURCE=%s/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY"
+          } >> "$GITHUB_ENV"
+
+      - name: Find the last successful image set
+        id: previous
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          api="repos/$GITHUB_REPOSITORY/actions"
+          workflow=$(gh api "$api/runs/$GITHUB_RUN_ID" --jq '.workflow_id')
+          previous=$(gh api --method GET "$api/workflows/$workflow/runs" \
+            -f branch=develop -f event=push -f status=success -F per_page=1 \
+            --jq '.workflow_runs[0] // empty | [.id,.head_sha] | @tsv')
+
+          if [[ -n "$previous" ]]; then
+            read -r run commit <<< "$previous"
+            artifact=$(gh api --method GET "$api/runs/$run/artifacts" -f name=image-set \
+              --jq '.artifacts[] | select(.expired == false) | .id')
+            printf 'run=%s\ncommit=%s\nartifact=%s\n' "$run" "$commit" "$artifact" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+        with:
+          url: https://github.com/oras-project/oras/releases/download/v1.4.0/oras_1.4.0_linux_${{ vars.VPS_PLATFORM == 'linux/arm64' && 'arm64' || 'amd64' }}.tar.gz
+          checksum: ${{ vars.VPS_PLATFORM == 'linux/arm64' && '0791fc200831563e498638d30e8ee8aac20ad1da2610760120fe3f770e12a8a4' || 'd8e1dce2fd8ce996f1d901845b688eb0cf505a6082897606f053825bb47935d1' }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the last successful image set
+        if: steps.previous.outputs.artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ steps.previous.outputs.artifact }}
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.previous.outputs.run }}
+          path: ${{ runner.temp }}/previous-image-set
+
+      - name: Recover image set from GHCR
+        if: steps.previous.outputs.artifact == '' && steps.previous.outputs.commit != ''
+        shell: bash
+        env:
+          PREVIOUS_COMMIT: ${{ steps.previous.outputs.commit }}
+        run: |
+          log="$RUNNER_TEMP/previous-image-set.log"
+          if ! oras pull "$IMAGE_PREFIX/image-set:$PREVIOUS_COMMIT-${VPS_PLATFORM#linux/}" \
+            --output "$RUNNER_TEMP/previous-image-set" > "$log" 2>&1; then
+            cat "$log" >&2
+            grep -Fq 'not found' "$log"
+          fi
+
+      - name: Select a comparison base
+        id: baseline
+        shell: bash
+        run: |
+          previous="$RUNNER_TEMP/previous-image-set/image-set.json"
+          if [[ -f "$previous" ]] &&
+            base=$(jq -er --arg platform "$VPS_PLATFORM" --arg services "$ALL_SERVICES" '
+              select(.platform == $platform and (.images | keys) == ($services | split(",")))
+              | .commit | select(test("^[0-9a-f]{40}$"))
+            ' "$previous") &&
+            git merge-base --is-ancestor "$base" HEAD; then
+            printf 'commit=%s\nmanifest=%s\n' "$base" "$previous" >> "$GITHUB_OUTPUT"
+          else
+            empty="$RUNNER_TEMP/empty-image-set.json"
+            printf '{"images":{}}\n' > "$empty"
+            printf 'manifest=%s\n' "$empty" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect image input changes
+        id: changes
+        if: steps.baseline.outputs.commit != '' && steps.baseline.outputs.commit != github.sha
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          base: ${{ steps.baseline.outputs.commit }}
+          ref: ${{ github.sha }}
+          filters: |
+            configuration:
+              - '.github/docker-bake.hcl'
+            backend:
+              - 'backend/Dockerfile'
+              - 'backend/.dockerignore'
+              - 'backend/package.json'
+              - 'backend/package-lock.json'
+              - 'backend/services/*/package.json'
+            runtime:
+              - 'backend/packages/**'
+              - 'backend/tsconfig*.json'
+            bot:
+              - 'backend/services/bot/**'
+            core:
+              - 'backend/services/core/**'
+            input:
+              - 'backend/services/input/**'
+            migrate:
+              - 'backend/services/core/drizzle.config.ts'
+              - 'backend/services/core/drizzle/**'
+            mini-app:
+              - 'mini-app/.dockerignore'
+              - 'mini-app/Dockerfile'
+              - 'mini-app/package.json'
+              - 'mini-app/package-lock.json'
+              - 'mini-app/nuxt.config.ts'
+              - 'mini-app/tsconfig.json'
+              - 'mini-app/nginx.conf.template'
+              - 'mini-app/app/**'
+              - 'mini-app/shared/**'
+            whisper:
+              - 'backend/.dockerignore'
+              - 'backend/Dockerfile.whisper'
+
+      - name: Select Docker targets
+        id: plan
+        shell: bash
+        env:
+          BASE_COMMIT: ${{ steps.baseline.outputs.commit }}
+          CHANGES: ${{ steps.changes.outputs.changes || '[]' }}
+        run: |
+          if [[ -z "$BASE_COMMIT" ]]; then
+            targets="$ALL_SERVICES"
+          else
+            targets=$(jq -r --arg services "$ALL_SERVICES" '
+              . as $changes
+              | if index("configuration") != null then $services
+                else
+                  $services | split(",") | map(
+                    . as $service | select(
+                      ($changes | index($service)) != null
+                      or (($changes | index("backend")) != null and
+                          (["bot", "core", "input", "migrate"] | index($service)) != null)
+                      or (($changes | index("runtime")) != null and
+                          (["bot", "core", "input"] | index($service)) != null)
+                    )
+                  ) | join(",")
+                end
+            ' <<< "$CHANGES")
+          fi
+          printf 'targets=%s\n' "$targets" >> "$GITHUB_OUTPUT"
+          printf 'Docker targets: %s\n' "${targets:-none}"
+
+      - name: Set up Docker Buildx
+        if: steps.plan.outputs.targets != ''
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push selected images
+        id: build
+        if: steps.plan.outputs.targets != ''
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: .github/docker-bake.hcl
+          targets: ${{ steps.plan.outputs.targets }}
+          push: true
+
+      - name: Record the complete image set
+        shell: bash
+        env:
+          PREVIOUS_MANIFEST: ${{ steps.baseline.outputs.manifest }}
+          TARGETS: ${{ steps.plan.outputs.targets }}
+          METADATA: ${{ steps.build.outputs.metadata || '{}' }}
+        run: |
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg compose "$(git rev-parse HEAD:compose.yaml)" \
+            --arg platform "$VPS_PLATFORM" \
+            --arg prefix "$IMAGE_PREFIX" \
+            --arg services "$ALL_SERVICES" \
+            --arg targets "$TARGETS" \
+            --argjson metadata "$METADATA" \
+            --slurpfile previous "$PREVIOUS_MANIFEST" '
+              ($services | split(",")) as $all
+              | ($targets | split(",") | map(select(length > 0)) | sort) as $expected
+              | ($metadata | with_entries(select(.key as $service | $all | index($service)))) as $built
+              | if ($built | keys) != $expected then error("Missing or unexpected Docker build results") else . end
+              | ($built | with_entries(
+                  .key as $service | .value = (.value."containerimage.digest"
+                    | if test("^sha256:[0-9a-f]{64}$") then . else error("Invalid image digest") end
+                    | $prefix + "/" + $service + "@" + .)
+                )) as $published
+              | ($previous[0].images + $published) as $images
+              | if ($images | keys) != $all then error("Incomplete image set") else . end
+              | {commit: $commit, tree: $tree, compose: $compose, platform: $platform, images: $images}
+            ' > "$RUNNER_TEMP/image-set.json"
+
+      - name: Preserve image sets in GHCR
+        shell: bash
+        env:
+          PREVIOUS_MANIFEST: ${{ steps.baseline.outputs.manifest }}
+          PREVIOUS_COMMIT: ${{ steps.baseline.outputs.commit }}
+        run: |
+          publish_image_set() {
+            local file=$1 commit=$2 reference digest
+            reference="$IMAGE_PREFIX/image-set:$commit-${VPS_PLATFORM#linux/}"
+            local existing="$RUNNER_TEMP/existing-image-set-$commit"
+            mkdir -p "$existing"
+            if oras pull "$reference" --output "$existing" > "$existing/pull.log" 2>&1; then
+              cmp "$file" "$existing/image-set.json"
+            elif grep -Fq 'not found' "$existing/pull.log"; then
+              (
+                cd "$(dirname "$file")"
+                oras push "$reference" \
+                  --artifact-type application/vnd.financebro.image-set.v1+json \
+                  --annotation "org.opencontainers.image.source=$IMAGE_SOURCE" \
+                  --annotation "org.opencontainers.image.revision=$commit" \
+                  image-set.json:application/json
+              )
+            else
+              cat "$existing/pull.log" >&2
+              return 1
+            fi
+            digest=$(oras resolve "$reference")
+            printf 'Image set: `%s/image-set@%s`\n\n' "$IMAGE_PREFIX" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if [[ -n "$PREVIOUS_COMMIT" && "$PREVIOUS_COMMIT" != "$GITHUB_SHA" ]]; then
+            publish_image_set "$PREVIOUS_MANIFEST" "$PREVIOUS_COMMIT"
+          fi
+          publish_image_set "$RUNNER_TEMP/image-set.json" "$GITHUB_SHA"
+
+      - name: Upload the complete image set
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-set
+          path: ${{ runner.temp }}/image-set.json
+          if-no-files-found: error
+          overwrite: true
+
+  deploy-dev:
+    name: Deploy FinanceBro dev
+    needs: publish
+    environment: dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-set
+          path: ${{ runner.temp }}/financebro-image-set
+
+      - name: Apply image set over restricted SSH
+        shell: bash
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CORE_SERVICE_TOKEN: ${{ secrets.CORE_SERVICE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$SSH_HOST" = '135.106.172.166'
+          test "$SSH_USER" = 'financebro-dev'
+          test -n "$SSH_KNOWN_HOSTS"
+          test -n "$SSH_PRIVATE_KEY"
+          manifest="$RUNNER_TEMP/financebro-image-set/image-set.json"
+          jq -e --arg commit "$GITHUB_SHA" --arg tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg compose "$(git rev-parse HEAD:compose.yaml)" \
+            '.commit == $commit and .tree == $tree and .compose == $compose' "$manifest" >/dev/null
+          ssh_dir=$(mktemp -d)
+          trap 'rm -f "$ssh_dir/key" "$ssh_dir/known_hosts"; rmdir "$ssh_dir"' EXIT
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          python3 - "$manifest" <<'PY' | \
+            ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+              -o UserKnownHostsFile="$ssh_dir/known_hosts" -i "$ssh_dir/key" \
+              -l "$SSH_USER" -- "$SSH_HOST"
+          import json
+          import os
+          import sys
+
+          names = ('BOT_TOKEN', 'POSTGRES_PASSWORD', 'DATABASE_URL', 'CORE_SERVICE_TOKEN')
+          secrets = {name: os.environ.get(name) for name in names}
+          missing = [name for name, value in secrets.items() if not value]
+          if missing:
+              sys.exit('Missing dev environment secrets: ' + ', '.join(missing))
+          with open(sys.argv[1], encoding='utf-8') as artifact:
+              json.dump({'manifest': json.load(artifact), 'secrets': secrets}, sys.stdout)
+          PY
+
+      - name: Verify public dev HTTPS
+        shell: bash
+        run: |
+          url='https://135.106.172.166:8443'
+          test "$(curl -fsS --max-time 15 -o /dev/null -w '%{http_code}' "$url/")" = 200
+          test "$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' \
+            "$url/api/analytics/overview?period=current-month")" = 401

@@ -110,7 +110,8 @@ jobs:
     name: CI required
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      contents: read
     needs: [lint-and-format, backend, mini-app]
     if: ${{ always() }}
     steps:
@@ -122,3 +123,27 @@ jobs:
         run: |
           printf 'Lint and formatting: %s\nBackend: %s\nMini App: %s\n' "$LINT_RESULT" "$BACKEND_RESULT" "$MINI_APP_RESULT"
           test "$LINT_RESULT" = success && test "$BACKEND_RESULT" = success && test "$MINI_APP_RESULT" = success
+
+      - uses: actions/checkout@v7
+        if: github.base_ref == 'main'
+        with:
+          persist-credentials: false
+          token: ${{ github.token }}
+
+      - name: Record the tested production tree
+        if: github.base_ref == 'main'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          jq -n --argjson pr "$PR_NUMBER" --arg head "$PR_HEAD" \
+            --arg tree "$(git rev-parse 'HEAD^{tree}')" \
+            '{pr:$pr, head:$head, tree:$tree}' > "$RUNNER_TEMP/tested-tree.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.base_ref == 'main'
+        with:
+          name: tested-tree
+          path: ${{ runner.temp }}/tested-tree.json
+          if-no-files-found: error
+          overwrite: true
